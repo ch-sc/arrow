@@ -20,7 +20,7 @@
 
 use std::{collections::HashMap, fmt, sync::Arc};
 
-use crate::basic::{LogicalType, Repetition};
+use crate::basic::{ConvertedType, Repetition};
 use crate::errors::{ParquetError, Result};
 use crate::file::reader::{FileReader, RowGroupReader};
 use crate::record::{
@@ -138,9 +138,9 @@ impl TreeBuilder {
             let column = TripletIter::new(col_descr, col_reader, self.batch_size);
             Reader::PrimitiveReader(field, column)
         } else {
-            match field.get_basic_info().logical_type() {
+            match field.get_basic_info().converted_type() {
                 // List types
-                LogicalType::LIST => {
+                ConvertedType::LIST => {
                     assert_eq!(
                         field.get_fields().len(),
                         1,
@@ -198,7 +198,7 @@ impl TreeBuilder {
                     }
                 }
                 // Map types (key-value pairs)
-                LogicalType::MAP | LogicalType::MAP_KEY_VALUE => {
+                ConvertedType::MAP | ConvertedType::MAP_KEY_VALUE => {
                     assert_eq!(
                         field.get_fields().len(),
                         1,
@@ -269,7 +269,7 @@ impl TreeBuilder {
                 _ if repetition == Repetition::REPEATED => {
                     let required_field = Type::group_type_builder(field.name())
                         .with_repetition(Repetition::REQUIRED)
-                        .with_logical_type(field.get_basic_info().logical_type())
+                        .with_converted_type(field.get_basic_info().converted_type())
                         .with_fields(&mut Vec::from(field.get_fields()))
                         .build()
                         .unwrap();
@@ -1522,7 +1522,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_reader_iter() -> Result<()> {
+    fn test_file_reader_iter() {
         let path = get_test_path("alltypes_plain.parquet");
         let vec = vec![path]
             .iter()
@@ -1532,12 +1532,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(vec, vec![4, 5, 6, 7, 2, 3, 0, 1]);
-
-        Ok(())
     }
 
     #[test]
-    fn test_file_reader_iter_projection() -> Result<()> {
+    fn test_file_reader_iter_projection() {
         let path = get_test_path("alltypes_plain.parquet");
         let values = vec![path]
             .iter()
@@ -1553,8 +1551,6 @@ mod tests {
             .join(", ");
 
         assert_eq!(values, "id:4, id:5, id:6, id:7, id:2, id:3, id:0, id:1");
-
-        Ok(())
     }
 
     #[test]

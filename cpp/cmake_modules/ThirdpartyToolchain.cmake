@@ -69,6 +69,7 @@ set(ARROW_THIRDPARTY_DEPENDENCIES
     Snappy
     Thrift
     utf8proc
+    xsimd
     ZLIB
     zstd)
 
@@ -170,6 +171,8 @@ macro(build_dependency DEPENDENCY_NAME)
     build_thrift()
   elseif("${DEPENDENCY_NAME}" STREQUAL "utf8proc")
     build_utf8proc()
+  elseif("${DEPENDENCY_NAME}" STREQUAL "xsimd")
+    build_xsimd()
   elseif("${DEPENDENCY_NAME}" STREQUAL "ZLIB")
     build_zlib()
   elseif("${DEPENDENCY_NAME}" STREQUAL "zstd")
@@ -368,7 +371,6 @@ else()
     AWSSDK_SOURCE_URL
     "https://github.com/aws/aws-sdk-cpp/archive/${ARROW_AWSSDK_BUILD_VERSION}.tar.gz"
     "https://github.com/ursa-labs/thirdparty/releases/download/latest/aws-sdk-cpp-${ARROW_AWSSDK_BUILD_VERSION}.tar.gz"
-    "https://dl.bintray.com/ursalabs/arrow-awssdk/aws-sdk-cpp-${ARROW_AWSSDK_BUILD_VERSION}.tar.gz/aws-sdk-cpp-${ARROW_AWSSDK_BUILD_VERSION}.tar.gz"
     )
 endif()
 
@@ -381,14 +383,12 @@ else()
     BOOST_SOURCE_URL
     # These are trimmed boost bundles we maintain.
     # See cpp/build-support/trim-boost.sh
-    "https://dl.bintray.com/ursalabs/arrow-boost/boost_${ARROW_BOOST_BUILD_VERSION_UNDERSCORES}.tar.gz"
-    "https://dl.bintray.com/boostorg/release/${ARROW_BOOST_BUILD_VERSION}/source/boost_${ARROW_BOOST_BUILD_VERSION_UNDERSCORES}.tar.gz"
-    "https://github.com/boostorg/boost/archive/boost-${ARROW_BOOST_BUILD_VERSION}.tar.gz"
     # FIXME(ARROW-6407) automate uploading this archive to ensure it reflects
     # our currently used packages and doesn't fall out of sync with
     # ${ARROW_BOOST_BUILD_VERSION_UNDERSCORES}
     "https://github.com/ursa-labs/thirdparty/releases/download/latest/boost_${ARROW_BOOST_BUILD_VERSION_UNDERSCORES}.tar.gz"
-    )
+    "https://sourceforge.net/projects/boost/files/boost/${ARROW_BOOST_BUILD_VERSION}/boost_${ARROW_BOOST_BUILD_VERSION_UNDERSCORES}.tar.gz"
+    "https://github.com/boostorg/boost/archive/boost-${ARROW_BOOST_BUILD_VERSION}.tar.gz")
 endif()
 
 if(DEFINED ENV{ARROW_BROTLI_URL})
@@ -459,7 +459,6 @@ else()
     "https://github.com/google/googletest/archive/release-${ARROW_GTEST_BUILD_VERSION}.tar.gz"
     "https://chromium.googlesource.com/external/github.com/google/googletest/+archive/release-${ARROW_GTEST_BUILD_VERSION}.tar.gz"
     "https://github.com/ursa-labs/thirdparty/releases/download/latest/gtest-${ARROW_GTEST_BUILD_VERSION}.tar.gz"
-    "https://dl.bintray.com/ursalabs/arrow-gtest/gtest-${ARROW_GTEST_BUILD_VERSION}.tar.gz"
     )
 endif()
 
@@ -565,8 +564,15 @@ else()
     "https://mirrors.sonic.net/apache/thrift/${ARROW_THRIFT_BUILD_VERSION}/thrift-${ARROW_THRIFT_BUILD_VERSION}.tar.gz"
     "https://us.mirrors.quenda.co/apache/thrift/${ARROW_THRIFT_BUILD_VERSION}/thrift-${ARROW_THRIFT_BUILD_VERSION}.tar.gz"
     "https://github.com/ursa-labs/thirdparty/releases/download/latest/thrift-${ARROW_THRIFT_BUILD_VERSION}.tar.gz"
-    "https://dl.bintray.com/ursalabs/arrow-thrift/thrift-${ARROW_THRIFT_BUILD_VERSION}.tar.gz"
     )
+endif()
+
+if(DEFINED ENV{ARROW_XSIMD_URL})
+  set(XSIMD_SOURCE_URL "$ENV{ARROW_XSIMD_URL}")
+else()
+  set_urls(
+    XSIMD_SOURCE_URL
+    "https://github.com/xtensor-stack/xsimd/archive/${ARROW_XSIMD_BUILD_VERSION}.tar.gz")
 endif()
 
 if(DEFINED ENV{ARROW_ZLIB_URL})
@@ -713,7 +719,7 @@ macro(build_boost)
       set(BOOST_CONFIGURE_COMMAND "./bootstrap.sh")
     endif()
 
-    set(BOOST_BUILD_WITH_LIBRARIES "filesystem" "regex" "system")
+    set(BOOST_BUILD_WITH_LIBRARIES "filesystem" "system")
     string(REPLACE ";" "," BOOST_CONFIGURE_LIBRARIES "${BOOST_BUILD_WITH_LIBRARIES}")
     list(APPEND BOOST_CONFIGURE_COMMAND "--prefix=${BOOST_PREFIX}"
                 "--with-libraries=${BOOST_CONFIGURE_LIBRARIES}")
@@ -754,22 +760,14 @@ macro(build_boost)
       BOOST_STATIC_FILESYSTEM_LIBRARY
       "${BOOST_LIB_DIR}/libboost_filesystem${BOOST_LIBRARY_SUFFIX}${CMAKE_STATIC_LIBRARY_SUFFIX}"
       )
-    set(
-      BOOST_STATIC_REGEX_LIBRARY
-      "${BOOST_LIB_DIR}/libboost_regex${BOOST_LIBRARY_SUFFIX}${CMAKE_STATIC_LIBRARY_SUFFIX}"
-      )
     set(BOOST_SYSTEM_LIBRARY boost_system_static)
     set(BOOST_FILESYSTEM_LIBRARY boost_filesystem_static)
-    set(BOOST_REGEX_LIBRARY boost_regex_static)
     set(BOOST_BUILD_PRODUCTS ${BOOST_STATIC_SYSTEM_LIBRARY}
-                             ${BOOST_STATIC_FILESYSTEM_LIBRARY}
-                             ${BOOST_STATIC_REGEX_LIBRARY})
+                             ${BOOST_STATIC_FILESYSTEM_LIBRARY})
 
     add_thirdparty_lib(boost_system STATIC_LIB "${BOOST_STATIC_SYSTEM_LIBRARY}")
 
     add_thirdparty_lib(boost_filesystem STATIC_LIB "${BOOST_STATIC_FILESYSTEM_LIBRARY}")
-
-    add_thirdparty_lib(boost_regex STATIC_LIB "${BOOST_STATIC_REGEX_LIBRARY}")
 
     externalproject_add(boost_ep
                         URL ${BOOST_SOURCE_URL}
@@ -778,8 +776,7 @@ macro(build_boost)
                         CONFIGURE_COMMAND ${BOOST_CONFIGURE_COMMAND}
                         BUILD_COMMAND ${BOOST_BUILD_COMMAND}
                         INSTALL_COMMAND "" ${EP_LOG_OPTIONS})
-    list(APPEND ARROW_BUNDLED_STATIC_LIBS boost_system_static boost_filesystem_static
-                boost_regex_static)
+    list(APPEND ARROW_BUNDLED_STATIC_LIBS boost_system_static boost_filesystem_static)
   else()
     externalproject_add(boost_ep
                         ${EP_LOG_OPTIONS}
@@ -805,6 +802,8 @@ if(MSVC AND ARROW_USE_STATIC_CRT)
   set(Boost_USE_STATIC_RUNTIME ON)
 endif()
 set(Boost_ADDITIONAL_VERSIONS
+    "1.75.0"
+    "1.75"
     "1.74.0"
     "1.74"
     "1.73.0"
@@ -854,13 +853,6 @@ else()
   set(THRIFT_REQUIRES_BOOST FALSE)
 endif()
 
-# Parquet requires boost only with gcc 4.8 (because of missing std::regex).
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "4.9")
-  set(PARQUET_REQUIRES_BOOST TRUE)
-else()
-  set(PARQUET_REQUIRES_BOOST FALSE)
-endif()
-
 # Compilers that don't support int128_t have a compile-time
 # (header-only) dependency on Boost for int128_t.
 if(ARROW_USE_UBSAN)
@@ -878,8 +870,7 @@ endif()
 if(ARROW_BUILD_INTEGRATION
    OR ARROW_BUILD_TESTS
    OR (ARROW_FLIGHT AND ARROW_BUILD_BENCHMARKS)
-   OR (ARROW_S3 AND ARROW_BUILD_BENCHMARKS)
-   OR (ARROW_PARQUET AND PARQUET_REQUIRES_BOOST))
+   OR (ARROW_S3 AND ARROW_BUILD_BENCHMARKS))
   set(ARROW_BOOST_REQUIRED TRUE)
   set(ARROW_BOOST_REQUIRE_LIBRARY TRUE)
 elseif(ARROW_GANDIVA
@@ -904,15 +895,12 @@ if(ARROW_BOOST_REQUIRED)
   if(TARGET Boost::system)
     set(BOOST_SYSTEM_LIBRARY Boost::system)
     set(BOOST_FILESYSTEM_LIBRARY Boost::filesystem)
-    set(BOOST_REGEX_LIBRARY Boost::regex)
   elseif(BoostAlt_FOUND)
     set(BOOST_SYSTEM_LIBRARY ${Boost_SYSTEM_LIBRARY})
     set(BOOST_FILESYSTEM_LIBRARY ${Boost_FILESYSTEM_LIBRARY})
-    set(BOOST_REGEX_LIBRARY ${Boost_REGEX_LIBRARY})
   else()
     set(BOOST_SYSTEM_LIBRARY boost_system_static)
     set(BOOST_FILESYSTEM_LIBRARY boost_filesystem_static)
-    set(BOOST_REGEX_LIBRARY boost_regex_static)
   endif()
   set(ARROW_BOOST_LIBS ${BOOST_SYSTEM_LIBRARY} ${BOOST_FILESYSTEM_LIBRARY})
 
@@ -1240,6 +1228,10 @@ endif()
 # Thrift
 
 macro(build_thrift)
+  if(CMAKE_VERSION VERSION_LESS 3.10)
+    message(
+      FATAL_ERROR "Building thrift using ExternalProject requires at least CMake 3.10")
+  endif()
   message("Building Apache Thrift from source")
   set(THRIFT_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/thrift_ep-install")
   set(THRIFT_INCLUDE_DIR "${THRIFT_PREFIX}/include")
@@ -1249,8 +1241,6 @@ macro(build_thrift)
       "-DCMAKE_INSTALL_RPATH=${THRIFT_PREFIX}/lib"
       -DBUILD_COMPILER=OFF
       -DBUILD_SHARED_LIBS=OFF
-      # DWITH_SHARED_LIB is removed in 0.13
-      -DWITH_SHARED_LIB=OFF
       -DBUILD_TESTING=OFF
       -DBUILD_EXAMPLES=OFF
       -DBUILD_TUTORIALS=OFF
@@ -1647,6 +1637,10 @@ macro(build_gtest)
     GTEST_MAIN_SHARED_LIB
     "${_GTEST_LIBRARY_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}gtest_main${_GTEST_LIBRARY_SUFFIX}"
     )
+  set(GTEST_INSTALL_NAME_DIR "$<INSTALL_PREFIX$<ANGLE-R>/lib")
+  # Fix syntax highlighting mess introduced by unclosed bracket above
+  set(dummy ">")
+
   set(GTEST_CMAKE_ARGS
       ${EP_COMMON_TOOLCHAIN}
       -DBUILD_SHARED_LIBS=ON
@@ -1654,7 +1648,7 @@ macro(build_gtest)
       -DCMAKE_CXX_FLAGS=${GTEST_CMAKE_CXX_FLAGS}
       -DCMAKE_CXX_FLAGS_${UPPERCASE_BUILD_TYPE}=${GTEST_CMAKE_CXX_FLAGS}
       -DCMAKE_INSTALL_LIBDIR=lib
-      -DCMAKE_INSTALL_NAME_DIR=$<INSTALL_PREFIX$<ANGLE-R>/lib
+      -DCMAKE_INSTALL_NAME_DIR=${GTEST_INSTALL_NAME_DIR}
       -DCMAKE_INSTALL_PREFIX=${GTEST_PREFIX}
       -DCMAKE_MACOSX_RPATH=OFF)
   set(GMOCK_INCLUDE_DIR "${GTEST_PREFIX}/include")
@@ -1917,6 +1911,33 @@ if(ARROW_WITH_RAPIDJSON)
   include_directories(SYSTEM ${RAPIDJSON_INCLUDE_DIR})
 endif()
 
+macro(build_xsimd)
+  message(STATUS "Building xsimd from source")
+  set(XSIMD_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/xsimd_ep/src/xsimd_ep-install")
+  set(XSIMD_CMAKE_ARGS ${EP_COMMON_CMAKE_ARGS} "-DCMAKE_INSTALL_PREFIX=${XSIMD_PREFIX}")
+
+  externalproject_add(xsimd_ep
+                      ${EP_LOG_OPTIONS}
+                      PREFIX "${CMAKE_BINARY_DIR}"
+                      URL ${XSIMD_SOURCE_URL}
+                      CMAKE_ARGS ${XSIMD_CMAKE_ARGS})
+
+  set(XSIMD_INCLUDE_DIR "${XSIMD_PREFIX}/include")
+
+  add_dependencies(toolchain xsimd_ep)
+  add_dependencies(toolchain-tests xsimd_ep)
+
+  set(XSIMD_VENDORED TRUE)
+endmacro()
+
+# For now xsimd is always bundled from upstream
+if(1)
+  set(xsimd_SOURCE "BUNDLED")
+  resolve_dependency(xsimd)
+  # TODO: Don't use global includes but rather target_include_directories
+  include_directories(SYSTEM ${XSIMD_INCLUDE_DIR})
+endif()
+
 macro(build_zlib)
   message(STATUS "Building ZLIB from source")
   set(ZLIB_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/zlib_ep/src/zlib_ep-install")
@@ -1975,7 +1996,7 @@ macro(build_lz4)
       endif()
     endif()
     set(LZ4_STATIC_LIB
-        "${LZ4_BUILD_DIR}/visual/VS2010/bin/x64_${CMAKE_BUILD_TYPE}/liblz4_static.lib")
+        "${LZ4_BUILD_DIR}/build/VS2010/bin/x64_${CMAKE_BUILD_TYPE}/liblz4_static.lib")
     set(LZ4_BUILD_COMMAND
         BUILD_COMMAND
         msbuild.exe
@@ -1985,7 +2006,7 @@ macro(build_lz4)
         /p:PlatformToolset=v140
         ${LZ4_RUNTIME_LIBRARY_LINKAGE}
         /t:Build
-        ${LZ4_BUILD_DIR}/visual/VS2010/lz4.sln)
+        ${LZ4_BUILD_DIR}/build/VS2010/lz4.sln)
   else()
     set(LZ4_STATIC_LIB "${LZ4_BUILD_DIR}/lib/liblz4.a")
     set(LZ4_BUILD_COMMAND BUILD_COMMAND ${CMAKE_SOURCE_DIR}/build-support/build-lz4-lib.sh
@@ -2115,7 +2136,8 @@ macro(build_re2)
   set(RE2_STATIC_LIB
       "${RE2_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}re2${CMAKE_STATIC_LIBRARY_SUFFIX}")
 
-  set(RE2_CMAKE_ARGS ${EP_COMMON_CMAKE_ARGS} "-DCMAKE_INSTALL_PREFIX=${RE2_PREFIX}")
+  set(RE2_CMAKE_ARGS ${EP_COMMON_CMAKE_ARGS} "-DCMAKE_INSTALL_PREFIX=${RE2_PREFIX}"
+                     -DCMAKE_INSTALL_LIBDIR=lib)
 
   externalproject_add(re2_ep
                       ${EP_LOG_OPTIONS}
@@ -2352,6 +2374,7 @@ macro(build_grpc)
       spinlock_wait
       stacktrace
       status
+      statusor
       str_format_internal
       strings
       strings_internal
@@ -2803,7 +2826,8 @@ macro(build_awssdk)
                       ${EP_LOG_OPTIONS}
                       URL ${AWS_CHECKSUMS_SOURCE_URL}
                       CMAKE_ARGS ${AWSSDK_COMMON_CMAKE_ARGS}
-                      BUILD_BYPRODUCTS ${AWS_CHECKSUMS_STATIC_LIBRARY})
+                      BUILD_BYPRODUCTS ${AWS_CHECKSUMS_STATIC_LIBRARY}
+                      DEPENDS aws_c_common_ep)
   add_dependencies(AWS::aws-checksums aws_checksums_ep)
 
   externalproject_add(aws_c_event_stream_ep
@@ -2811,7 +2835,7 @@ macro(build_awssdk)
                       URL ${AWS_C_EVENT_STREAM_SOURCE_URL}
                       CMAKE_ARGS ${AWSSDK_COMMON_CMAKE_ARGS}
                       BUILD_BYPRODUCTS ${AWS_C_EVENT_STREAM_STATIC_LIBRARY}
-                      DEPENDS aws_c_common_ep aws_checksums_ep)
+                      DEPENDS aws_checksums_ep)
   add_dependencies(AWS::aws-c-event-stream aws_c_event_stream_ep)
 
   externalproject_add(awssdk_ep

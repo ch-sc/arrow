@@ -90,6 +90,15 @@ struct PartitioningFactoryOptions {
   /// columns, and Expressions parsed by the finished Partitioning will include
   /// dictionaries of all unique inspected values for each field.
   bool infer_dictionary = false;
+  /// Optionally, an expected schema can be provided, in which case inference
+  /// will only check discovered fields against the schema and update internal
+  /// state (such as dictionaries).
+  std::shared_ptr<Schema> schema;
+};
+
+struct HivePartitioningFactoryOptions : PartitioningFactoryOptions {
+  /// The hive partitioning scheme maps null to a hard coded fallback string.
+  std::string null_fallback;
 };
 
 /// \brief PartitioningFactory provides creation of a partitioning  when the
@@ -119,11 +128,9 @@ class ARROW_DS_EXPORT KeyValuePartitioning : public Partitioning {
   /// An unconverted equality expression consisting of a field name and the representation
   /// of a scalar value
   struct Key {
-    std::string name, value;
+    std::string name;
+    util::optional<std::string> value;
   };
-
-  static Status SetDefaultValuesFromKeys(const Expression& expr,
-                                         RecordBatchProjector* projector);
 
   Result<PartitionedBatches> Partition(
       const std::shared_ptr<RecordBatch>& batch) const override;
@@ -175,6 +182,8 @@ class ARROW_DS_EXPORT DirectoryPartitioning : public KeyValuePartitioning {
   Result<std::string> FormatValues(const ScalarVector& values) const override;
 };
 
+static constexpr char kDefaultHiveNullFallback[] = "__HIVE_DEFAULT_PARTITION__";
+
 /// \brief Multi-level, directory based partitioning
 /// originating from Apache Hive with all data files stored in the
 /// leaf directories. Data is partitioned by static values of a
@@ -188,17 +197,22 @@ class ARROW_DS_EXPORT HivePartitioning : public KeyValuePartitioning {
  public:
   // If a field in schema is of dictionary type, the corresponding element of dictionaries
   // must be contain the dictionary of values for that field.
-  explicit HivePartitioning(std::shared_ptr<Schema> schema, ArrayVector dictionaries = {})
-      : KeyValuePartitioning(std::move(schema), std::move(dictionaries)) {}
+  explicit HivePartitioning(std::shared_ptr<Schema> schema, ArrayVector dictionaries = {},
+                            std::string null_fallback = kDefaultHiveNullFallback)
+      : KeyValuePartitioning(std::move(schema), std::move(dictionaries)),
+        null_fallback_(null_fallback) {}
 
   std::string type_name() const override { return "hive"; }
+  std::string null_fallback() const { return null_fallback_; }
 
-  static util::optional<Key> ParseKey(const std::string& segment);
+  static util::optional<Key> ParseKey(const std::string& segment,
+                                      const std::string& null_fallback);
 
   static std::shared_ptr<PartitioningFactory> MakeFactory(
-      PartitioningFactoryOptions = {});
+      HivePartitioningFactoryOptions = {});
 
  private:
+  const std::string null_fallback_;
   std::vector<Key> ParseKeys(const std::string& path) const override;
 
   Result<std::string> FormatValues(const ScalarVector& values) const override;

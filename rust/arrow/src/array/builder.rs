@@ -47,7 +47,7 @@ pub(crate) fn mutable_buffer_to_builder<T: ArrowNativeType>(
     }
 }
 
-///  Converts a `BufferBuilder<T>` into it's underlying `MutableBuffer`.
+///  Converts a `BufferBuilder<T>` into its underlying `MutableBuffer`.
 ///
 /// `From` is not implemented because associated type bounds are unstable.
 pub(crate) fn builder_to_mutable_buffer<T: ArrowNativeType>(
@@ -297,14 +297,17 @@ impl BooleanBufferBuilder {
         Self { buffer, len: 0 }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.buffer.capacity() * 8
     }
@@ -369,6 +372,13 @@ impl BooleanBufferBuilder {
         let buf = std::mem::replace(&mut self.buffer, MutableBuffer::new(0));
         self.len = 0;
         buf.into()
+    }
+}
+
+impl From<BooleanBufferBuilder> for Buffer {
+    #[inline]
+    fn from(builder: BooleanBufferBuilder) -> Self {
+        builder.buffer.into()
     }
 }
 
@@ -516,7 +526,9 @@ impl ArrayBuilder for BooleanBuilder {
 #[derive(Debug)]
 pub struct PrimitiveBuilder<T: ArrowPrimitiveType> {
     values_builder: BufferBuilder<T::Native>,
-    bitmap_builder: BooleanBufferBuilder,
+    /// We only materialize the builder when we add `false`.
+    /// This optimization is **very** important for performance of `StringBuilder`.
+    bitmap_builder: Option<BooleanBufferBuilder>,
 }
 
 impl<T: ArrowPrimitiveType> ArrayBuilder for PrimitiveBuilder<T> {
@@ -556,7 +568,7 @@ impl<T: ArrowPrimitiveType> PrimitiveBuilder<T> {
     pub fn new(capacity: usize) -> Self {
         Self {
             values_builder: BufferBuilder::<T::Native>::new(capacity),
-            bitmap_builder: BooleanBufferBuilder::new(capacity),
+            bitmap_builder: None,
         }
     }
 
@@ -567,14 +579,17 @@ impl<T: ArrowPrimitiveType> PrimitiveBuilder<T> {
 
     /// Appends a value of type `T` into the builder
     pub fn append_value(&mut self, v: T::Native) -> Result<()> {
-        self.bitmap_builder.append(true);
+        if let Some(b) = self.bitmap_builder.as_mut() {
+            b.append(true);
+        }
         self.values_builder.append(v);
         Ok(())
     }
 
     /// Appends a null slot into the builder
     pub fn append_null(&mut self) -> Result<()> {
-        self.bitmap_builder.append(false);
+        self.materialize_bitmap_builder();
+        self.bitmap_builder.as_mut().unwrap().append(false);
         self.values_builder.advance(1);
         Ok(())
     }
@@ -590,7 +605,9 @@ impl<T: ArrowPrimitiveType> PrimitiveBuilder<T> {
 
     /// Appends a slice of type `T` into the builder
     pub fn append_slice(&mut self, v: &[T::Native]) -> Result<()> {
-        self.bitmap_builder.append_n(v.len(), true);
+        if let Some(b) = self.bitmap_builder.as_mut() {
+            b.append_n(v.len(), true);
+        }
         self.values_builder.append_slice(v);
         Ok(())
     }
@@ -606,7 +623,12 @@ impl<T: ArrowPrimitiveType> PrimitiveBuilder<T> {
                 "Value and validity lengths must be equal".to_string(),
             ));
         }
-        self.bitmap_builder.append_slice(is_valid);
+        if is_valid.iter().any(|v| !*v) {
+            self.materialize_bitmap_builder();
+        }
+        if let Some(b) = self.bitmap_builder.as_mut() {
+            b.append_slice(is_valid);
+        }
         self.values_builder.append_slice(values);
         Ok(())
     }
@@ -614,13 +636,17 @@ impl<T: ArrowPrimitiveType> PrimitiveBuilder<T> {
     /// Builds the `PrimitiveArray` and reset this builder.
     pub fn finish(&mut self) -> PrimitiveArray<T> {
         let len = self.len();
-        let null_bit_buffer = self.bitmap_builder.finish();
-        let null_count = len - null_bit_buffer.count_set_bits();
+        let null_bit_buffer = self.bitmap_builder.as_mut().map(|b| b.finish());
+        let null_count = len
+            - null_bit_buffer
+                .as_ref()
+                .map(|b| b.count_set_bits())
+                .unwrap_or(len);
         let mut builder = ArrayData::builder(T::DATA_TYPE)
             .len(len)
             .add_buffer(self.values_builder.finish());
         if null_count > 0 {
-            builder = builder.null_bit_buffer(null_bit_buffer);
+            builder = builder.null_bit_buffer(null_bit_buffer.unwrap());
         }
         let data = builder.build();
         PrimitiveArray::<T>::from(data)
@@ -629,8 +655,12 @@ impl<T: ArrowPrimitiveType> PrimitiveBuilder<T> {
     /// Builds the `DictionaryArray` and reset this builder.
     pub fn finish_dict(&mut self, values: ArrayRef) -> DictionaryArray<T> {
         let len = self.len();
-        let null_bit_buffer = self.bitmap_builder.finish();
-        let null_count = len - null_bit_buffer.count_set_bits();
+        let null_bit_buffer = self.bitmap_builder.as_mut().map(|b| b.finish());
+        let null_count = len
+            - null_bit_buffer
+                .as_ref()
+                .map(|b| b.count_set_bits())
+                .unwrap_or(len);
         let data_type = DataType::Dictionary(
             Box::new(T::DATA_TYPE),
             Box::new(values.data_type().clone()),
@@ -639,10 +669,20 @@ impl<T: ArrowPrimitiveType> PrimitiveBuilder<T> {
             .len(len)
             .add_buffer(self.values_builder.finish());
         if null_count > 0 {
-            builder = builder.null_bit_buffer(null_bit_buffer);
+            builder = builder.null_bit_buffer(null_bit_buffer.unwrap());
         }
         builder = builder.add_child_data(values.data());
         DictionaryArray::<T>::from(builder.build())
+    }
+
+    fn materialize_bitmap_builder(&mut self) {
+        if self.bitmap_builder.is_some() {
+            return;
+        }
+        let mut b = BooleanBufferBuilder::new(0);
+        b.reserve(self.values_builder.capacity());
+        b.append_n(self.values_builder.len, true);
+        self.bitmap_builder = Some(b);
     }
 }
 
@@ -754,7 +794,7 @@ where
             values_data.data_type().clone(),
             true, // TODO: find a consistent way of getting this
         ));
-        let data_type = if OffsetSize::prefix() == "Large" {
+        let data_type = if OffsetSize::is_large() {
             DataType::LargeList(field)
         } else {
             DataType::List(field)
@@ -1084,8 +1124,8 @@ impl<OffsetSize: BinaryOffsetSizeTrait> GenericBinaryBuilder<OffsetSize> {
     ///
     /// Automatically calls the `append` method to delimit the slice appended in as a
     /// distinct array element.
-    pub fn append_value(&mut self, value: &[u8]) -> Result<()> {
-        self.builder.values().append_slice(value)?;
+    pub fn append_value(&mut self, value: impl AsRef<[u8]>) -> Result<()> {
+        self.builder.values().append_slice(value.as_ref())?;
         self.builder.append(true)?;
         Ok(())
     }
@@ -1130,8 +1170,10 @@ impl<OffsetSize: StringOffsetSizeTrait> GenericStringBuilder<OffsetSize> {
     ///
     /// Automatically calls the `append` method to delimit the string appended in as a
     /// distinct array element.
-    pub fn append_value(&mut self, value: &str) -> Result<()> {
-        self.builder.values().append_slice(value.as_bytes())?;
+    pub fn append_value(&mut self, value: impl AsRef<str>) -> Result<()> {
+        self.builder
+            .values()
+            .append_slice(value.as_ref().as_bytes())?;
         self.builder.append(true)?;
         Ok(())
     }
@@ -1166,13 +1208,13 @@ impl FixedSizeBinaryBuilder {
     ///
     /// Automatically calls the `append` method to delimit the slice appended in as a
     /// distinct array element.
-    pub fn append_value(&mut self, value: &[u8]) -> Result<()> {
-        if self.builder.value_length() != value.len() as i32 {
+    pub fn append_value(&mut self, value: impl AsRef<[u8]>) -> Result<()> {
+        if self.builder.value_length() != value.as_ref().len() as i32 {
             return Err(ArrowError::InvalidArgumentError(
                 "Byte slice does not have the same length as FixedSizeBinaryBuilder value lengths".to_string()
             ));
         }
-        self.builder.values().append_slice(value)?;
+        self.builder.values().append_slice(value.as_ref())?;
         self.builder.append(true)
     }
 
@@ -1256,7 +1298,6 @@ impl DecimalBuilder {
 /// properly called to maintain the consistency of the data structure.
 pub struct StructBuilder {
     fields: Vec<Field>,
-    field_anys: Vec<Box<Any>>,
     field_builders: Vec<Box<ArrayBuilder>>,
     bitmap_builder: BooleanBufferBuilder,
     len: usize,
@@ -1266,7 +1307,6 @@ impl fmt::Debug for StructBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StructBuilder")
             .field("fields", &self.fields)
-            .field("field_anys", &self.field_anys)
             .field("bitmap_builder", &self.bitmap_builder)
             .field("len", &self.len)
             .finish()
@@ -1342,8 +1382,8 @@ pub fn make_builder(datatype: &DataType, capacity: usize) -> Box<ArrayBuilder> {
             Box::new(DecimalBuilder::new(capacity, *precision, *scale))
         }
         DataType::Utf8 => Box::new(StringBuilder::new(capacity)),
-        DataType::Date32(DateUnit::Day) => Box::new(Date32Builder::new(capacity)),
-        DataType::Date64(DateUnit::Millisecond) => Box::new(Date64Builder::new(capacity)),
+        DataType::Date32 => Box::new(Date32Builder::new(capacity)),
+        DataType::Date64 => Box::new(Date64Builder::new(capacity)),
         DataType::Time32(TimeUnit::Second) => {
             Box::new(Time32SecondBuilder::new(capacity))
         }
@@ -1394,25 +1434,9 @@ pub fn make_builder(datatype: &DataType, capacity: usize) -> Box<ArrayBuilder> {
 }
 
 impl StructBuilder {
-    pub fn new(fields: Vec<Field>, builders: Vec<Box<ArrayBuilder>>) -> Self {
-        let mut field_anys = Vec::with_capacity(builders.len());
-        let mut field_builders = Vec::with_capacity(builders.len());
-
-        // Create and maintain two references for each of the input builder. We need the
-        // extra `Any` reference because we need to cast the builder to a specific type
-        // in `field_builder()` by calling `downcast_mut`.
-        for f in builders.into_iter() {
-            let raw_f = Box::into_raw(f);
-            let raw_f_copy = raw_f;
-            unsafe {
-                field_anys.push(Box::from_raw(raw_f).into_box_any());
-                field_builders.push(Box::from_raw(raw_f_copy));
-            }
-        }
-
+    pub fn new(fields: Vec<Field>, field_builders: Vec<Box<ArrayBuilder>>) -> Self {
         Self {
             fields,
-            field_anys,
             field_builders,
             bitmap_builder: BooleanBufferBuilder::new(0),
             len: 0,
@@ -1431,7 +1455,7 @@ impl StructBuilder {
     /// Result will be `None` if the input type `T` provided doesn't match the actual
     /// field builder's type.
     pub fn field_builder<T: ArrayBuilder>(&mut self, i: usize) -> Option<&mut T> {
-        self.field_anys[i].downcast_mut::<T>()
+        self.field_builders[i].as_any_mut().downcast_mut::<T>()
     }
 
     /// Returns the number of fields for the struct this builder is building.
@@ -1475,14 +1499,6 @@ impl StructBuilder {
     }
 }
 
-impl Drop for StructBuilder {
-    fn drop(&mut self) {
-        // To avoid double drop on the field array builders.
-        let builders = std::mem::replace(&mut self.field_builders, Vec::new());
-        std::mem::forget(builders);
-    }
-}
-
 /// `FieldData` is a helper struct to track the state of the fields in the `UnionBuilder`.
 #[derive(Debug)]
 struct FieldData {
@@ -1515,6 +1531,7 @@ impl FieldData {
     }
 
     /// Appends a single value to this `FieldData`'s `values_buffer`.
+    #[allow(clippy::unnecessary_wraps)]
     fn append_to_values_buffer<T: ArrowPrimitiveType>(
         &mut self,
         v: T::Native,
@@ -1537,6 +1554,7 @@ impl FieldData {
     }
 
     /// Appends a null to this `FieldData`.
+    #[allow(clippy::unnecessary_wraps)]
     fn append_null<T: ArrowPrimitiveType>(&mut self) -> Result<()> {
         if let Some(b) = &mut self.bitmap_builder {
             let values_buffer = self
@@ -1569,14 +1587,14 @@ impl FieldData {
             DataType::Int8 => self.append_null::<Int8Type>()?,
             DataType::Int16 => self.append_null::<Int16Type>()?,
             DataType::Int32
-            | DataType::Date32(_)
+            | DataType::Date32
             | DataType::Time32(_)
             | DataType::Interval(IntervalUnit::YearMonth) => {
                 self.append_null::<Int32Type>()?
             }
             DataType::Int64
             | DataType::Timestamp(_, _)
-            | DataType::Date64(_)
+            | DataType::Date64
             | DataType::Time64(_)
             | DataType::Interval(IntervalUnit::DayTime)
             | DataType::Duration(_) => self.append_null::<Int64Type>()?,
@@ -2013,8 +2031,8 @@ where
     /// Append a primitive value to the array. Return an existing index
     /// if already present in the values array or a new index if the
     /// value is appended to the values array.
-    pub fn append(&mut self, value: &str) -> Result<K::Native> {
-        if let Some(&key) = self.map.get(value.as_bytes()) {
+    pub fn append(&mut self, value: impl AsRef<str>) -> Result<K::Native> {
+        if let Some(&key) = self.map.get(value.as_ref().as_bytes()) {
             // Append existing value.
             self.keys_builder.append_value(key)?;
             Ok(key)
@@ -2022,9 +2040,9 @@ where
             // Append new value.
             let key = K::Native::from_usize(self.values_builder.len())
                 .ok_or(ArrowError::DictionaryKeyOverflowError)?;
-            self.values_builder.append_value(value)?;
+            self.values_builder.append_value(value.as_ref())?;
             self.keys_builder.append_value(key as K::Native)?;
-            self.map.insert(value.as_bytes().into(), key);
+            self.map.insert(value.as_ref().as_bytes().into(), key);
             Ok(key)
         }
     }
@@ -2420,7 +2438,7 @@ mod tests {
         assert_eq!(DataType::Int32, list_array.value_type());
         assert_eq!(3, list_array.len());
         assert_eq!(0, list_array.null_count());
-        assert_eq!(6, list_array.value_offset(2));
+        assert_eq!(6, list_array.value_offsets()[2]);
         assert_eq!(2, list_array.value_length(2));
         for i in 0..3 {
             assert!(list_array.is_valid(i));
@@ -2456,7 +2474,7 @@ mod tests {
         assert_eq!(DataType::Int32, list_array.value_type());
         assert_eq!(3, list_array.len());
         assert_eq!(0, list_array.null_count());
-        assert_eq!(6, list_array.value_offset(2));
+        assert_eq!(6, list_array.value_offsets()[2]);
         assert_eq!(2, list_array.value_length(2));
         for i in 0..3 {
             assert!(list_array.is_valid(i));
@@ -2487,7 +2505,7 @@ mod tests {
         assert_eq!(DataType::Int32, list_array.value_type());
         assert_eq!(4, list_array.len());
         assert_eq!(1, list_array.null_count());
-        assert_eq!(3, list_array.value_offset(2));
+        assert_eq!(3, list_array.value_offsets()[2]);
         assert_eq!(3, list_array.value_length(2));
     }
 
@@ -2514,7 +2532,7 @@ mod tests {
         assert_eq!(DataType::Int32, list_array.value_type());
         assert_eq!(4, list_array.len());
         assert_eq!(1, list_array.null_count());
-        assert_eq!(3, list_array.value_offset(2));
+        assert_eq!(3, list_array.value_offsets()[2]);
         assert_eq!(3, list_array.value_length(2));
     }
 
@@ -2681,7 +2699,7 @@ mod tests {
         assert_eq!([b'h', b'e', b'l', b'l', b'o'], binary_array.value(0));
         assert_eq!([] as [u8; 0], binary_array.value(1));
         assert_eq!([b'w', b'o', b'r', b'l', b'd'], binary_array.value(2));
-        assert_eq!(5, binary_array.value_offset(2));
+        assert_eq!(5, binary_array.value_offsets()[2]);
         assert_eq!(5, binary_array.value_length(2));
     }
 
@@ -2710,7 +2728,7 @@ mod tests {
         assert_eq!([b'h', b'e', b'l', b'l', b'o'], binary_array.value(0));
         assert_eq!([] as [u8; 0], binary_array.value(1));
         assert_eq!([b'w', b'o', b'r', b'l', b'd'], binary_array.value(2));
-        assert_eq!(5, binary_array.value_offset(2));
+        assert_eq!(5, binary_array.value_offsets()[2]);
         assert_eq!(5, binary_array.value_length(2));
     }
 
@@ -2729,7 +2747,7 @@ mod tests {
         assert_eq!("hello", string_array.value(0));
         assert_eq!("", string_array.value(1));
         assert_eq!("world", string_array.value(2));
-        assert_eq!(5, string_array.value_offset(2));
+        assert_eq!(5, string_array.value_offsets()[2]);
         assert_eq!(5, string_array.value_length(2));
     }
 
@@ -2802,7 +2820,7 @@ mod tests {
         assert_eq!("hello", string_array.value(0));
         assert_eq!("", string_array.value(1));
         assert_eq!("world", string_array.value(2));
-        assert_eq!(5, string_array.value_offset(2));
+        assert_eq!(5, string_array.value_offsets()[2]);
         assert_eq!(5, string_array.value_length(2));
     }
 

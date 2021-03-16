@@ -70,29 +70,16 @@ std::shared_ptr<Partitioning> Partitioning::Default() {
   return std::make_shared<DefaultPartitioning>();
 }
 
-Status KeyValuePartitioning::SetDefaultValuesFromKeys(const Expression& expr,
-                                                      RecordBatchProjector* projector) {
-  ARROW_ASSIGN_OR_RAISE(auto known_values, ExtractKnownFieldValues(expr));
-  for (const auto& ref_value : known_values) {
-    if (!ref_value.second.is_scalar()) {
-      return Status::Invalid("non-scalar partition key ", ref_value.second.ToString());
-    }
-
-    ARROW_ASSIGN_OR_RAISE(auto match,
-                          ref_value.first.FindOneOrNone(*projector->schema()));
-
-    if (match.empty()) continue;
-    RETURN_NOT_OK(projector->SetDefaultValue(match, ref_value.second.scalar()));
-  }
-  return Status::OK();
-}
-
 inline Expression ConjunctionFromGroupingRow(Scalar* row) {
   ScalarVector* values = &checked_cast<StructScalar*>(row)->value;
   std::vector<Expression> equality_expressions(values->size());
   for (size_t i = 0; i < values->size(); ++i) {
     const std::string& name = row->type->field(static_cast<int>(i))->name();
-    equality_expressions[i] = equal(field_ref(name), literal(std::move(values->at(i))));
+    if (values->at(i)->is_valid) {
+      equality_expressions[i] = equal(field_ref(name), literal(std::move(values->at(i))));
+    } else {
+      equality_expressions[i] = is_null(field_ref(name));
+    }
   }
   return and_(std::move(equality_expressions));
 }
@@ -147,7 +134,9 @@ Result<Expression> KeyValuePartitioning::ConvertKey(const Key& key) const {
 
   std::shared_ptr<Scalar> converted;
 
-  if (field->type()->id() == Type::DICTIONARY) {
+  if (!key.value.has_value()) {
+    return is_null(field_ref(field->name()));
+  } else if (field->type()->id() == Type::DICTIONARY) {
     if (dictionaries_.empty() || dictionaries_[field_index] == nullptr) {
       return Status::Invalid("No dictionary provided for dictionary field ",
                              field->ToString());
@@ -156,24 +145,26 @@ Result<Expression> KeyValuePartitioning::ConvertKey(const Key& key) const {
     DictionaryScalar::ValueType value;
     value.dictionary = dictionaries_[field_index];
 
-    if (!value.dictionary->type()->Equals(
-            checked_cast<const DictionaryType&>(*field->type()).value_type())) {
+    const auto& dictionary_type = checked_cast<const DictionaryType&>(*field->type());
+    if (!value.dictionary->type()->Equals(dictionary_type.value_type())) {
       return Status::TypeError("Dictionary supplied for field ", field->ToString(),
                                " had incorrect type ",
                                value.dictionary->type()->ToString());
     }
 
     // look up the partition value in the dictionary
-    ARROW_ASSIGN_OR_RAISE(converted, Scalar::Parse(value.dictionary->type(), key.value));
+    ARROW_ASSIGN_OR_RAISE(converted, Scalar::Parse(value.dictionary->type(), *key.value));
     ARROW_ASSIGN_OR_RAISE(auto index, compute::IndexIn(converted, value.dictionary));
+    auto to_index_type = compute::CastOptions::Safe(dictionary_type.index_type());
+    ARROW_ASSIGN_OR_RAISE(index, compute::Cast(index, to_index_type));
     value.index = index.scalar();
     if (!value.index->is_valid) {
       return Status::Invalid("Dictionary supplied for field ", field->ToString(),
-                             " does not contain '", key.value, "'");
+                             " does not contain '", *key.value, "'");
     }
     converted = std::make_shared<DictionaryScalar>(std::move(value), field->type());
   } else {
-    ARROW_ASSIGN_OR_RAISE(converted, Scalar::Parse(field->type(), key.value));
+    ARROW_ASSIGN_OR_RAISE(converted, Scalar::Parse(field->type(), *key.value));
   }
 
   return equal(field_ref(field->name()), literal(std::move(converted)));
@@ -207,8 +198,18 @@ Result<std::string> KeyValuePartitioning::Format(const Expression& expr) const {
 
     const auto& field = schema_->field(match[0]);
     if (!value->type->Equals(field->type())) {
-      return Status::TypeError("scalar ", value->ToString(), " (of type ", *value->type,
-                               ") is invalid for ", field->ToString());
+      if (value->is_valid) {
+        auto maybe_converted = compute::Cast(value, field->type());
+        if (!maybe_converted.ok()) {
+          return Status::TypeError("Error converting scalar ", value->ToString(),
+                                   " (of type ", *value->type,
+                                   ") to a partition key for ", field->ToString(), ": ",
+                                   maybe_converted.status().message());
+        }
+        value = maybe_converted->scalar();
+      } else {
+        value = MakeNullScalar(field->type());
+      }
     }
 
     if (value->type->id() == Type::DICTIONARY) {
@@ -252,7 +253,7 @@ Result<std::string> DirectoryPartitioning::FormatValues(
   std::vector<std::string> segments(static_cast<size_t>(schema_->num_fields()));
 
   for (int i = 0; i < schema_->num_fields(); ++i) {
-    if (values[i] != nullptr) {
+    if (values[i] != nullptr && values[i]->is_valid) {
       segments[i] = values[i]->ToString();
       continue;
     }
@@ -287,8 +288,13 @@ class KeyValuePartitioningFactory : public PartitioningFactory {
     return it_inserted.first->second;
   }
 
-  Status InsertRepr(const std::string& name, util::string_view repr) {
-    return InsertRepr(GetOrInsertField(name), repr);
+  Status InsertRepr(const std::string& name, util::optional<string_view> repr) {
+    auto field_index = GetOrInsertField(name);
+    if (repr.has_value()) {
+      return InsertRepr(field_index, *repr);
+    } else {
+      return Status::OK();
+    }
   }
 
   Status InsertRepr(int index, util::string_view repr) {
@@ -296,10 +302,18 @@ class KeyValuePartitioningFactory : public PartitioningFactory {
     return repr_memos_[index]->GetOrInsert<StringType>(repr, &dummy);
   }
 
-  Result<std::shared_ptr<Schema>> DoInpsect() {
+  Result<std::shared_ptr<Schema>> DoInspect() {
     dictionaries_.assign(name_to_index_.size(), nullptr);
 
     std::vector<std::shared_ptr<Field>> fields(name_to_index_.size());
+    if (options_.schema) {
+      const auto requested_size = options_.schema->fields().size();
+      const auto inferred_size = fields.size();
+      if (inferred_size != requested_size) {
+        return Status::Invalid("Requested schema has ", requested_size,
+                               " fields, but only ", inferred_size, " were detected");
+      }
+    }
 
     for (const auto& name_index : name_to_index_) {
       const auto& name = name_index.first;
@@ -309,19 +323,38 @@ class KeyValuePartitioningFactory : public PartitioningFactory {
       RETURN_NOT_OK(repr_memos_[index]->GetArrayData(0, &reprs));
 
       if (reprs->length == 0) {
-        return Status::Invalid("No segments were available for field '", name,
+        return Status::Invalid("No non-null segments were available for field '", name,
                                "'; couldn't infer type");
       }
 
-      // try casting to int32, otherwise bail and just use the string reprs
-      auto dict = compute::Cast(reprs, int32()).ValueOr(reprs).make_array();
-      auto type = dict->type();
-      if (options_.infer_dictionary) {
-        // wrap the inferred type in dictionary()
-        type = dictionary(int32(), std::move(type));
+      std::shared_ptr<Field> current_field;
+      std::shared_ptr<Array> dict;
+      if (options_.schema) {
+        // if we have a schema, use the schema type.
+        current_field = options_.schema->field(index);
+        auto cast_target = current_field->type();
+        if (is_dictionary(cast_target->id())) {
+          cast_target = checked_pointer_cast<DictionaryType>(cast_target)->value_type();
+        }
+        auto maybe_dict = compute::Cast(reprs, cast_target);
+        if (!maybe_dict.ok()) {
+          return Status::Invalid("Could not cast segments for partition field ",
+                                 current_field->name(), " to requested type ",
+                                 current_field->type()->ToString(),
+                                 " because: ", maybe_dict.status());
+        }
+        dict = maybe_dict.ValueOrDie().make_array();
+      } else {
+        // try casting to int32, otherwise bail and just use the string reprs
+        dict = compute::Cast(reprs, int32()).ValueOr(reprs).make_array();
+        auto type = dict->type();
+        if (options_.infer_dictionary) {
+          // wrap the inferred type in dictionary()
+          type = dictionary(int32(), std::move(type));
+        }
+        current_field = field(name, std::move(type));
       }
-
-      fields[index] = field(name, std::move(type));
+      fields[index] = std::move(current_field);
       dictionaries_[index] = std::move(dict);
     }
 
@@ -375,7 +408,7 @@ class DirectoryPartitioningFactory : public KeyValuePartitioningFactory {
       }
     }
 
-    return DoInpsect();
+    return DoInspect();
   }
 
   Result<std::shared_ptr<Partitioning>> Finish(
@@ -410,13 +443,19 @@ std::shared_ptr<PartitioningFactory> DirectoryPartitioning::MakeFactory(
 }
 
 util::optional<KeyValuePartitioning::Key> HivePartitioning::ParseKey(
-    const std::string& segment) {
+    const std::string& segment, const std::string& null_fallback) {
   auto name_end = string_view(segment).find_first_of('=');
+  // Not round-trippable
   if (name_end == string_view::npos) {
     return util::nullopt;
   }
 
-  return Key{segment.substr(0, name_end), segment.substr(name_end + 1)};
+  auto name = segment.substr(0, name_end);
+  auto value = segment.substr(name_end + 1);
+  if (value == null_fallback) {
+    return Key{name, util::nullopt};
+  }
+  return Key{name, value};
 }
 
 std::vector<KeyValuePartitioning::Key> HivePartitioning::ParseKeys(
@@ -424,7 +463,7 @@ std::vector<KeyValuePartitioning::Key> HivePartitioning::ParseKeys(
   std::vector<Key> keys;
 
   for (const auto& segment : fs::internal::SplitAbstractPath(path)) {
-    if (auto key = ParseKey(segment)) {
+    if (auto key = ParseKey(segment, null_fallback_)) {
       keys.push_back(std::move(*key));
     }
   }
@@ -439,11 +478,11 @@ Result<std::string> HivePartitioning::FormatValues(const ScalarVector& values) c
     const std::string& name = schema_->field(i)->name();
 
     if (values[i] == nullptr) {
-      if (!NextValid(values, i)) break;
-
+      segments[i] = "";
+    } else if (!values[i]->is_valid) {
       // If no key is available just provide a placeholder segment to maintain the
       // field_index <-> path nesting relation
-      segments[i] = name;
+      segments[i] = name + "=" + null_fallback_;
     } else {
       segments[i] = name + "=" + values[i]->ToString();
     }
@@ -454,8 +493,8 @@ Result<std::string> HivePartitioning::FormatValues(const ScalarVector& values) c
 
 class HivePartitioningFactory : public KeyValuePartitioningFactory {
  public:
-  explicit HivePartitioningFactory(PartitioningFactoryOptions options)
-      : KeyValuePartitioningFactory(options) {}
+  explicit HivePartitioningFactory(HivePartitioningFactoryOptions options)
+      : KeyValuePartitioningFactory(options), null_fallback_(options.null_fallback) {}
 
   std::string type_name() const override { return "hive"; }
 
@@ -463,14 +502,14 @@ class HivePartitioningFactory : public KeyValuePartitioningFactory {
       const std::vector<std::string>& paths) override {
     for (auto path : paths) {
       for (auto&& segment : fs::internal::SplitAbstractPath(path)) {
-        if (auto key = HivePartitioning::ParseKey(segment)) {
+        if (auto key = HivePartitioning::ParseKey(segment, null_fallback_)) {
           RETURN_NOT_OK(InsertRepr(key->name, key->value));
         }
       }
     }
 
     field_names_ = FieldNames();
-    return DoInpsect();
+    return DoInspect();
   }
 
   Result<std::shared_ptr<Partitioning>> Finish(
@@ -486,16 +525,18 @@ class HivePartitioningFactory : public KeyValuePartitioningFactory {
       // drop fields which aren't in field_names_
       auto out_schema = SchemaFromColumnNames(schema, field_names_);
 
-      return std::make_shared<HivePartitioning>(std::move(out_schema), dictionaries_);
+      return std::make_shared<HivePartitioning>(std::move(out_schema), dictionaries_,
+                                                null_fallback_);
     }
   }
 
  private:
+  const std::string null_fallback_;
   std::vector<std::string> field_names_;
 };
 
 std::shared_ptr<PartitioningFactory> HivePartitioning::MakeFactory(
-    PartitioningFactoryOptions options) {
+    HivePartitioningFactoryOptions options) {
   return std::shared_ptr<PartitioningFactory>(new HivePartitioningFactory(options));
 }
 
@@ -578,10 +619,6 @@ class StructDictionary {
     Encoded out{nullptr, std::make_shared<StructDictionary>()};
 
     for (const auto& column : columns) {
-      if (column->null_count() != 0) {
-        return Status::NotImplemented("Grouping on a field with nulls");
-      }
-
       RETURN_NOT_OK(out.dictionary->AddOne(column, &out.indices));
     }
 
@@ -625,8 +662,27 @@ class StructDictionary {
 
  private:
   Status AddOne(Datum column, std::shared_ptr<Int32Array>* fused_indices) {
+    if (column.type()->id() == Type::DICTIONARY) {
+      if (column.null_count() != 0) {
+        // TODO(ARROW-11732) Optimize this by allowign DictionaryEncode to transfer a
+        // null-masked dictionary to a null-encoded dictionary.  At the moment we decode
+        // and then encode causing one extra copy, and a potentially expansive decoding
+        // copy at that.
+        ARROW_ASSIGN_OR_RAISE(
+            auto decoded_dictionary,
+            compute::Cast(
+                column,
+                std::static_pointer_cast<DictionaryType>(column.type())->value_type(),
+                compute::CastOptions()));
+        column = decoded_dictionary;
+      }
+    }
     if (column.type()->id() != Type::DICTIONARY) {
-      ARROW_ASSIGN_OR_RAISE(column, compute::DictionaryEncode(std::move(column)));
+      compute::DictionaryEncodeOptions options;
+      options.null_encoding_behavior =
+          compute::DictionaryEncodeOptions::NullEncodingBehavior::ENCODE;
+      ARROW_ASSIGN_OR_RAISE(column,
+                            compute::DictionaryEncode(std::move(column), options));
     }
 
     auto dict_column = column.array_as<DictionaryArray>();

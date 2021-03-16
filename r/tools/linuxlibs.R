@@ -19,7 +19,7 @@ args <- commandArgs(TRUE)
 VERSION <- args[1]
 dst_dir <- paste0("libarrow/arrow-", VERSION)
 
-arrow_repo <- "https://dl.bintray.com/ursalabs/arrow-r/libarrow/"
+arrow_repo <- "https://arrow-r-nightly.s3.amazonaws.com/libarrow/"
 
 if (getRversion() < 3.4 && is.null(getOption("download.file.method"))) {
   # default method doesn't work on R 3.3, nor does libcurl
@@ -322,6 +322,10 @@ build_libarrow <- function(src_dir, dst_dir) {
   env_vars <- paste0(names(env_var_list), '="', env_var_list, '"', collapse = " ")
   env_vars <- with_s3_support(env_vars)
   env_vars <- with_mimalloc(env_vars)
+  if (tolower(Sys.info()[["sysname"]]) %in% "sunos") {
+    # jemalloc doesn't seem to build on Solaris
+    env_vars <- paste(env_vars, "ARROW_JEMALLOC=OFF")
+  }
   cat("**** arrow", ifelse(quietly, "", paste("with", env_vars)), "\n")
   status <- system(
     paste(env_vars, "inst/build_arrow_static.sh"),
@@ -364,7 +368,7 @@ ensure_cmake <- function() {
   cmake
 }
 
-find_cmake <- function(paths, version_required = 3.2) {
+find_cmake <- function(paths, version_required = 3.10) {
   # Given a list of possible cmake paths, return the first one that exists and is new enough
   for (path in paths) {
     if (nzchar(path) && cmake_version(path) >= version_required) {

@@ -206,7 +206,6 @@ Summary:	Runtime libraries for Apache Arrow C++
 License:	Apache-2.0
 Requires:	boost%{boost_version}-system
 Requires:	boost%{boost_version}-filesystem
-Requires:	boost%{boost_version}-regex
 Requires:	brotli
 Requires:	gflags
 Requires:	glog
@@ -777,6 +776,9 @@ Documentation for Apache Parquet GLib.
 %{_datadir}/gtk-doc/html/parquet-glib/
 
 %changelog
+* Mon Jan 18 2021 Krisztián Szűcs <szucs.krisztian@gmail.com> - 3.0.0-1
+- New upstream release.
+
 * Mon Oct 12 2020 Krisztián Szűcs <szucs.krisztian@gmail.com> - 2.0.0-1
 - New upstream release.
 

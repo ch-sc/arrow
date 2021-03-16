@@ -18,14 +18,17 @@
 //! Defines the join plan for executing partitions in parallel and then joining the results
 //! into a set of partitions.
 
+use ahash::CallHasher;
 use ahash::RandomState;
+
 use arrow::{
     array::{
-        ArrayRef, BooleanArray, LargeStringArray, TimestampMicrosecondArray,
-        TimestampNanosecondArray, UInt32Builder, UInt64Builder,
+        ArrayData, ArrayRef, BooleanArray, LargeStringArray, PrimitiveArray,
+        TimestampMicrosecondArray, TimestampNanosecondArray, UInt32BufferBuilder,
+        UInt32Builder, UInt64BufferBuilder, UInt64Builder,
     },
     compute,
-    datatypes::TimeUnit,
+    datatypes::{TimeUnit, UInt32Type, UInt64Type},
 };
 use std::time::Instant;
 use std::{any::Any, collections::HashSet};
@@ -235,19 +238,26 @@ impl ExecutionPlan for HashJoinExec {
                     // This operation performs 2 steps at once:
                     // 1. creates a [JoinHashMap] of all batches from the stream
                     // 2. stores the batches in a vector.
-                    let initial =
-                        (JoinHashMap::with_hasher(IdHashBuilder {}), Vec::new(), 0);
-                    let (hashmap, batches, num_rows) = stream
+                    let initial = (
+                        JoinHashMap::with_hasher(IdHashBuilder {}),
+                        Vec::new(),
+                        0,
+                        Vec::new(),
+                    );
+                    let (hashmap, batches, num_rows, _) = stream
                         .try_fold(initial, |mut acc, batch| async {
                             let hash = &mut acc.0;
                             let values = &mut acc.1;
                             let offset = acc.2;
+                            acc.3.clear();
+                            acc.3.resize(batch.num_rows(), 0);
                             update_hash(
                                 &on_left,
                                 &batch,
                                 hash,
                                 offset,
                                 &self.random_state,
+                                &mut acc.3,
                             )
                             .unwrap();
                             acc.2 += batch.num_rows();
@@ -259,7 +269,7 @@ impl ExecutionPlan for HashJoinExec {
                     // Merge all batches into a single batch, so we
                     // can directly index into the arrays
                     let single_batch =
-                        concat_batches(&batches[0].schema(), &batches, num_rows)?;
+                        concat_batches(&self.left.schema(), &batches, num_rows)?;
 
                     let left_side = Arc::new((hashmap, single_batch));
 
@@ -309,6 +319,7 @@ fn update_hash(
     hash: &mut JoinHashMap,
     offset: usize,
     random_state: &RandomState,
+    hashes_buffer: &mut Vec<u64>,
 ) -> Result<()> {
     // evaluate the keys
     let keys_values = on
@@ -317,7 +328,7 @@ fn update_hash(
         .collect::<Result<Vec<_>>>()?;
 
     // update the hash map
-    let hash_values = create_hashes(&keys_values, &random_state)?;
+    let hash_values = create_hashes(&keys_values, &random_state, hashes_buffer)?;
 
     // insert hashes to key of the hashmap
     for (row, hash_value) in hash_values.iter().enumerate() {
@@ -474,15 +485,16 @@ fn build_join_indexes(
                 .into_array(left_data.1.num_rows()))
         })
         .collect::<Result<Vec<_>>>()?;
-
-    let hash_values = create_hashes(&keys_values, &random_state)?;
+    let hashes_buffer = &mut vec![0; keys_values[0].len()];
+    let hash_values = create_hashes(&keys_values, &random_state, hashes_buffer)?;
     let left = &left_data.0;
-
-    let mut left_indices = UInt64Builder::new(0);
-    let mut right_indices = UInt32Builder::new(0);
 
     match join_type {
         JoinType::Inner => {
+            // Using a buffer builder to avoid slower normal builder
+            let mut left_indices = UInt64BufferBuilder::new(0);
+            let mut right_indices = UInt32BufferBuilder::new(0);
+
             // Visit all of the right rows
             for (row, hash_value) in hash_values.iter().enumerate() {
                 // Get the hash and find it in the build index
@@ -494,15 +506,30 @@ fn build_join_indexes(
                     for &i in indices {
                         // Check hash collisions
                         if equal_rows(i as usize, row, &left_join_values, &keys_values)? {
-                            left_indices.append_value(i)?;
-                            right_indices.append_value(row as u32)?;
+                            left_indices.append(i);
+                            right_indices.append(row as u32);
                         }
                     }
                 }
             }
-            Ok((left_indices.finish(), right_indices.finish()))
+            let left = ArrayData::builder(DataType::UInt64)
+                .len(left_indices.len())
+                .add_buffer(left_indices.finish())
+                .build();
+            let right = ArrayData::builder(DataType::UInt32)
+                .len(right_indices.len())
+                .add_buffer(right_indices.finish())
+                .build();
+
+            Ok((
+                PrimitiveArray::<UInt64Type>::from(left),
+                PrimitiveArray::<UInt32Type>::from(right),
+            ))
         }
         JoinType::Left => {
+            let mut left_indices = UInt64Builder::new(0);
+            let mut right_indices = UInt32Builder::new(0);
+
             // Keep track of which item is visited in the build input
             // TODO: this can be stored more efficiently with a marker
             //       https://issues.apache.org/jira/browse/ARROW-11116
@@ -532,10 +559,12 @@ fn build_join_indexes(
                     }
                 }
             }
-
             Ok((left_indices.finish(), right_indices.finish()))
         }
         JoinType::Right => {
+            let mut left_indices = UInt64Builder::new(0);
+            let mut right_indices = UInt32Builder::new(0);
+
             for (row, hash_value) in hash_values.iter().enumerate() {
                 match left.get(hash_value) {
                     Some(indices) => {
@@ -676,20 +705,20 @@ fn equal_rows(
 }
 
 macro_rules! hash_array {
-    ($array_type:ident, $column: ident, $f: ident, $hashes: ident, $random_state: ident) => {
+    ($array_type:ident, $column: ident, $ty: ident, $hashes: ident, $random_state: ident) => {
         let array = $column.as_any().downcast_ref::<$array_type>().unwrap();
         if array.null_count() == 0 {
             for (i, hash) in $hashes.iter_mut().enumerate() {
-                let mut hasher = $random_state.build_hasher();
-                hasher.$f(array.value(i));
-                *hash = combine_hashes(hasher.finish(), *hash);
+                *hash =
+                    combine_hashes($ty::get_hash(&array.value(i), $random_state), *hash);
             }
         } else {
             for (i, hash) in $hashes.iter_mut().enumerate() {
-                let mut hasher = $random_state.build_hasher();
                 if !array.is_null(i) {
-                    hasher.$f(array.value(i));
-                    *hash = combine_hashes(hasher.finish(), *hash);
+                    *hash = combine_hashes(
+                        $ty::get_hash(&array.value(i), $random_state),
+                        *hash,
+                    );
                 }
             }
         }
@@ -697,42 +726,43 @@ macro_rules! hash_array {
 }
 
 /// Creates hash values for every element in the row based on the values in the columns
-fn create_hashes(arrays: &[ArrayRef], random_state: &RandomState) -> Result<Vec<u64>> {
-    let rows = arrays[0].len();
-    let mut hashes = vec![0; rows];
-
+pub fn create_hashes<'a>(
+    arrays: &[ArrayRef],
+    random_state: &RandomState,
+    hashes_buffer: &'a mut Vec<u64>,
+) -> Result<&'a mut Vec<u64>> {
     for col in arrays {
         match col.data_type() {
             DataType::UInt8 => {
-                hash_array!(UInt8Array, col, write_u8, hashes, random_state);
+                hash_array!(UInt8Array, col, u8, hashes_buffer, random_state);
             }
             DataType::UInt16 => {
-                hash_array!(UInt16Array, col, write_u16, hashes, random_state);
+                hash_array!(UInt16Array, col, u16, hashes_buffer, random_state);
             }
             DataType::UInt32 => {
-                hash_array!(UInt32Array, col, write_u32, hashes, random_state);
+                hash_array!(UInt32Array, col, u32, hashes_buffer, random_state);
             }
             DataType::UInt64 => {
-                hash_array!(UInt64Array, col, write_u64, hashes, random_state);
+                hash_array!(UInt64Array, col, u64, hashes_buffer, random_state);
             }
             DataType::Int8 => {
-                hash_array!(Int8Array, col, write_i8, hashes, random_state);
+                hash_array!(Int8Array, col, i8, hashes_buffer, random_state);
             }
             DataType::Int16 => {
-                hash_array!(Int16Array, col, write_i16, hashes, random_state);
+                hash_array!(Int16Array, col, i16, hashes_buffer, random_state);
             }
             DataType::Int32 => {
-                hash_array!(Int32Array, col, write_i32, hashes, random_state);
+                hash_array!(Int32Array, col, i32, hashes_buffer, random_state);
             }
             DataType::Int64 => {
-                hash_array!(Int64Array, col, write_i64, hashes, random_state);
+                hash_array!(Int64Array, col, i64, hashes_buffer, random_state);
             }
             DataType::Timestamp(TimeUnit::Microsecond, None) => {
                 hash_array!(
                     TimestampMicrosecondArray,
                     col,
-                    write_i64,
-                    hashes,
+                    i64,
+                    hashes_buffer,
                     random_state
                 );
             }
@@ -740,18 +770,16 @@ fn create_hashes(arrays: &[ArrayRef], random_state: &RandomState) -> Result<Vec<
                 hash_array!(
                     TimestampNanosecondArray,
                     col,
-                    write_i64,
-                    hashes,
+                    i64,
+                    hashes_buffer,
                     random_state
                 );
             }
+            DataType::Boolean => {
+                hash_array!(BooleanArray, col, u8, hashes_buffer, random_state);
+            }
             DataType::Utf8 => {
-                let array = col.as_any().downcast_ref::<StringArray>().unwrap();
-                for (i, hash) in hashes.iter_mut().enumerate() {
-                    let mut hasher = random_state.build_hasher();
-                    hasher.write(array.value(i).as_bytes());
-                    *hash = combine_hashes(hasher.finish(), *hash);
-                }
+                hash_array!(StringArray, col, str, hashes_buffer, random_state);
             }
             _ => {
                 // This is internal because we should have caught this before.
@@ -761,7 +789,7 @@ fn create_hashes(arrays: &[ArrayRef], random_state: &RandomState) -> Result<Vec<
             }
         }
     }
-    Ok(hashes)
+    Ok(hashes_buffer)
 }
 
 impl Stream for HashJoinStream {
@@ -814,12 +842,12 @@ impl Stream for HashJoinStream {
 #[cfg(test)]
 mod tests {
     use crate::{
+        assert_batches_sorted_eq,
         physical_plan::{common, memory::MemoryExec},
-        test::{build_table_i32, columns, format_batch},
+        test::{build_table_i32, columns},
     };
 
     use super::*;
-    use std::collections::HashSet;
     use std::sync::Arc;
 
     fn build_table(
@@ -829,7 +857,7 @@ mod tests {
     ) -> Arc<dyn ExecutionPlan> {
         let batch = build_table_i32(a, b, c);
         let schema = batch.schema();
-        Arc::new(MemoryExec::try_new(&vec![vec![batch]], schema, None).unwrap())
+        Arc::new(MemoryExec::try_new(&[vec![batch]], schema, None).unwrap())
     }
 
     fn join(
@@ -843,19 +871,6 @@ mod tests {
             .map(|(l, r)| (l.to_string(), r.to_string()))
             .collect();
         HashJoinExec::try_new(left, right, &on, join_type)
-    }
-
-    /// Asserts that the rows are the same, taking into account that their order
-    /// is irrelevant
-    fn assert_same_rows(result: &[String], expected: &[&str]) {
-        // convert to set since row order is irrelevant
-        let result = result.iter().cloned().collect::<HashSet<_>>();
-
-        let expected = expected
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<HashSet<_>>();
-        assert_eq!(result, expected);
     }
 
     #[tokio::test]
@@ -880,10 +895,16 @@ mod tests {
         let stream = join.execute(0).await?;
         let batches = common::collect(stream).await?;
 
-        let result = format_batch(&batches[0]);
-        let expected = vec!["2,5,8,20,80", "3,5,9,20,80", "1,4,7,10,70"];
-
-        assert_same_rows(&result, &expected);
+        let expected = vec![
+            "+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | c2 |",
+            "+----+----+----+----+----+",
+            "| 1  | 4  | 7  | 10 | 70 |",
+            "| 2  | 5  | 8  | 20 | 80 |",
+            "| 3  | 5  | 9  | 20 | 80 |",
+            "+----+----+----+----+----+",
+        ];
+        assert_batches_sorted_eq!(expected, &batches);
 
         Ok(())
     }
@@ -910,10 +931,17 @@ mod tests {
         let stream = join.execute(0).await?;
         let batches = common::collect(stream).await?;
 
-        let result = format_batch(&batches[0]);
-        let expected = vec!["2,5,8,20,5,80", "3,5,9,20,5,80", "1,4,7,10,4,70"];
+        let expected = vec![
+            "+----+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | b2 | c2 |",
+            "+----+----+----+----+----+----+",
+            "| 1  | 4  | 7  | 10 | 4  | 70 |",
+            "| 2  | 5  | 8  | 20 | 5  | 80 |",
+            "| 3  | 5  | 9  | 20 | 5  | 80 |",
+            "+----+----+----+----+----+----+",
+        ];
 
-        assert_same_rows(&result, &expected);
+        assert_batches_sorted_eq!(expected, &batches);
 
         Ok(())
     }
@@ -941,10 +969,17 @@ mod tests {
         let batches = common::collect(stream).await?;
         assert_eq!(batches.len(), 1);
 
-        let result = format_batch(&batches[0]);
-        let expected = vec!["1,1,7,70", "2,2,8,80", "2,2,9,80"];
+        let expected = vec![
+            "+----+----+----+----+",
+            "| a1 | b2 | c1 | c2 |",
+            "+----+----+----+----+",
+            "| 1  | 1  | 7  | 70 |",
+            "| 2  | 2  | 8  | 80 |",
+            "| 2  | 2  | 9  | 80 |",
+            "+----+----+----+----+",
+        ];
 
-        assert_same_rows(&result, &expected);
+        assert_batches_sorted_eq!(expected, &batches);
 
         Ok(())
     }
@@ -961,7 +996,7 @@ mod tests {
             build_table_i32(("a1", &vec![2]), ("b2", &vec![2]), ("c1", &vec![9]));
         let schema = batch1.schema();
         let left = Arc::new(
-            MemoryExec::try_new(&vec![vec![batch1], vec![batch2]], schema, None).unwrap(),
+            MemoryExec::try_new(&[vec![batch1], vec![batch2]], schema, None).unwrap(),
         );
 
         let right = build_table(
@@ -980,10 +1015,17 @@ mod tests {
         let batches = common::collect(stream).await?;
         assert_eq!(batches.len(), 1);
 
-        let result = format_batch(&batches[0]);
-        let expected = vec!["1,1,7,70", "2,2,8,80", "2,2,9,80"];
+        let expected = vec![
+            "+----+----+----+----+",
+            "| a1 | b2 | c1 | c2 |",
+            "+----+----+----+----+",
+            "| 1  | 1  | 7  | 70 |",
+            "| 2  | 2  | 8  | 80 |",
+            "| 2  | 2  | 9  | 80 |",
+            "+----+----+----+----+",
+        ];
 
-        assert_same_rows(&result, &expected);
+        assert_batches_sorted_eq!(expected, &batches);
 
         Ok(())
     }
@@ -1006,7 +1048,7 @@ mod tests {
             build_table_i32(("a2", &vec![30]), ("b1", &vec![5]), ("c2", &vec![90]));
         let schema = batch1.schema();
         let right = Arc::new(
-            MemoryExec::try_new(&vec![vec![batch1], vec![batch2]], schema, None).unwrap(),
+            MemoryExec::try_new(&[vec![batch1], vec![batch2]], schema, None).unwrap(),
         );
 
         let on = &[("b1", "b1")];
@@ -1021,18 +1063,29 @@ mod tests {
         let batches = common::collect(stream).await?;
         assert_eq!(batches.len(), 1);
 
-        let result = format_batch(&batches[0]);
-        let expected = vec!["1,4,7,10,70"];
-        assert_same_rows(&result, &expected);
+        let expected = vec![
+            "+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | c2 |",
+            "+----+----+----+----+----+",
+            "| 1  | 4  | 7  | 10 | 70 |",
+            "+----+----+----+----+----+",
+        ];
+        assert_batches_sorted_eq!(expected, &batches);
 
         // second part
         let stream = join.execute(1).await?;
         let batches = common::collect(stream).await?;
         assert_eq!(batches.len(), 1);
-        let result = format_batch(&batches[0]);
-        let expected = vec!["2,5,8,30,90", "3,5,9,30,90"];
+        let expected = vec![
+            "+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | c2 |",
+            "+----+----+----+----+----+",
+            "| 2  | 5  | 8  | 30 | 90 |",
+            "| 3  | 5  | 9  | 30 | 90 |",
+            "+----+----+----+----+----+",
+        ];
 
-        assert_same_rows(&result, &expected);
+        assert_batches_sorted_eq!(expected, &batches);
 
         Ok(())
     }
@@ -1059,10 +1112,16 @@ mod tests {
         let stream = join.execute(0).await?;
         let batches = common::collect(stream).await?;
 
-        let result = format_batch(&batches[0]);
-        let expected = vec!["1,4,7,10,70", "2,5,8,20,80", "3,7,9,NULL,NULL"];
-
-        assert_same_rows(&result, &expected);
+        let expected = vec![
+            "+----+----+----+----+----+",
+            "| a1 | b1 | c1 | a2 | c2 |",
+            "+----+----+----+----+----+",
+            "| 1  | 4  | 7  | 10 | 70 |",
+            "| 2  | 5  | 8  | 20 | 80 |",
+            "| 3  | 7  | 9  |    |    |",
+            "+----+----+----+----+----+",
+        ];
+        assert_batches_sorted_eq!(expected, &batches);
 
         Ok(())
     }
@@ -1089,10 +1148,17 @@ mod tests {
         let stream = join.execute(0).await?;
         let batches = common::collect(stream).await?;
 
-        let result = format_batch(&batches[0]);
-        let expected = vec!["1,7,10,4,70", "2,8,20,5,80", "NULL,NULL,30,6,90"];
+        let expected = vec![
+            "+----+----+----+----+----+",
+            "| a1 | c1 | a2 | b1 | c2 |",
+            "+----+----+----+----+----+",
+            "|    |    | 30 | 6  | 90 |",
+            "| 1  | 7  | 10 | 4  | 70 |",
+            "| 2  | 8  | 20 | 5  | 80 |",
+            "+----+----+----+----+----+",
+        ];
 
-        assert_same_rows(&result, &expected);
+        assert_batches_sorted_eq!(expected, &batches);
 
         Ok(())
     }
@@ -1107,8 +1173,9 @@ mod tests {
         );
 
         let random_state = RandomState::new();
-
-        let hashes = create_hashes(&[left.columns()[0].clone()], &random_state)?;
+        let hashes_buff = &mut vec![0; left.num_rows()];
+        let hashes =
+            create_hashes(&[left.columns()[0].clone()], &random_state, hashes_buff)?;
 
         // Create hash collisions
         hashmap_left.insert(hashes[0], vec![0, 1]);

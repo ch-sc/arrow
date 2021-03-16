@@ -56,8 +56,14 @@ static inline bool is_tensor_supported(Type::type type_id) {
 namespace internal {
 
 ARROW_EXPORT
-void ComputeRowMajorStrides(const FixedWidthType& type, const std::vector<int64_t>& shape,
-                            std::vector<int64_t>* strides);
+Status ComputeRowMajorStrides(const FixedWidthType& type,
+                              const std::vector<int64_t>& shape,
+                              std::vector<int64_t>* strides);
+
+ARROW_EXPORT
+Status ComputeColumnMajorStrides(const FixedWidthType& type,
+                                 const std::vector<int64_t>& shape,
+                                 std::vector<int64_t>* strides);
 
 ARROW_EXPORT
 void ComputeColumnMajorStrides(const FixedWidthType& type,

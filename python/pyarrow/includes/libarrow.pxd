@@ -54,8 +54,7 @@ cdef extern from "arrow/util/decimal.h" namespace "arrow" nogil:
         c_string ToString(int32_t scale) const
 
 
-cdef extern from "arrow/api.h" namespace "arrow" nogil:
-
+cdef extern from "arrow/config.h" namespace "arrow" nogil:
     cdef cppclass CBuildInfo "arrow::BuildInfo":
         int version
         int version_major
@@ -73,6 +72,14 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
 
     const CBuildInfo& GetBuildInfo()
 
+    cdef cppclass CRuntimeInfo "arrow::RuntimeInfo":
+        c_string simd_level
+        c_string detected_simd_level
+
+    CRuntimeInfo GetRuntimeInfo()
+
+
+cdef extern from "arrow/api.h" namespace "arrow" nogil:
     enum Type" arrow::Type::type":
         _Type_NA" arrow::Type::NA"
 
@@ -1027,6 +1034,16 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
         CConcatenateTablesOptions options,
         CMemoryPool* memory_pool)
 
+    cdef cppclass CDictionaryUnifier" arrow::DictionaryUnifier":
+        @staticmethod
+        CResult[shared_ptr[CChunkedArray]] UnifyChunkedArray(
+            shared_ptr[CChunkedArray] array, CMemoryPool* pool)
+
+        @staticmethod
+        CResult[shared_ptr[CTable]] UnifyTable(
+            const CTable& table, CMemoryPool* pool)
+
+
 cdef extern from "arrow/builder.h" namespace "arrow" nogil:
 
     cdef cppclass CArrayBuilder" arrow::ArrayBuilder":
@@ -1113,6 +1130,21 @@ ctypedef void CallbackTransform(
     object, const shared_ptr[CBuffer]& src, shared_ptr[CBuffer]* dest)
 
 
+cdef extern from "arrow/util/cancel.h" namespace "arrow" nogil:
+    cdef cppclass CStopToken "arrow::StopToken":
+        CStatus Poll()
+        c_bool IsStopRequested()
+
+    cdef cppclass CStopSource "arrow::StopSource":
+        CStopToken token()
+
+    CResult[CStopSource*] SetSignalStopSource()
+    void ResetSignalStopSource()
+
+    CStatus RegisterCancellingSignalHandler(vector[int] signals)
+    void UnregisterCancellingSignalHandler()
+
+
 cdef extern from "arrow/io/api.h" namespace "arrow::io" nogil:
     enum FileMode" arrow::io::FileMode::type":
         FileMode_READ" arrow::io::FileMode::READ"
@@ -1122,6 +1154,14 @@ cdef extern from "arrow/io/api.h" namespace "arrow::io" nogil:
     enum ObjectType" arrow::io::ObjectType::type":
         ObjectType_FILE" arrow::io::ObjectType::FILE"
         ObjectType_DIRECTORY" arrow::io::ObjectType::DIRECTORY"
+
+    cdef cppclass CIOContext" arrow::io::IOContext":
+        CIOContext()
+        CIOContext(CStopToken)
+        CIOContext(CMemoryPool*)
+        CIOContext(CMemoryPool*, CStopToken)
+
+    CIOContext c_default_io_context "arrow::io::default_io_context"()
 
     cdef cppclass FileStatistics:
         int64_t size
@@ -1598,10 +1638,17 @@ cdef extern from "arrow/csv/api.h" namespace "arrow::csv" nogil:
         @staticmethod
         CCSVReadOptions Defaults()
 
+    cdef cppclass CCSVWriteOptions" arrow::csv::WriteOptions":
+        c_bool include_header
+        int32_t batch_size
+
+        @staticmethod
+        CCSVWriteOptions Defaults()
+
     cdef cppclass CCSVReader" arrow::csv::TableReader":
         @staticmethod
         CResult[shared_ptr[CCSVReader]] Make(
-            CMemoryPool*, shared_ptr[CInputStream],
+            CIOContext, shared_ptr[CInputStream],
             CCSVReadOptions, CCSVParseOptions, CCSVConvertOptions)
 
         CResult[shared_ptr[CTable]] Read()
@@ -1610,8 +1657,13 @@ cdef extern from "arrow/csv/api.h" namespace "arrow::csv" nogil:
             CRecordBatchReader):
         @staticmethod
         CResult[shared_ptr[CCSVStreamingReader]] Make(
-            CMemoryPool*, shared_ptr[CInputStream],
+            CIOContext, shared_ptr[CInputStream],
             CCSVReadOptions, CCSVParseOptions, CCSVConvertOptions)
+
+    cdef CStatus WriteCSV(
+        CTable&, CCSVWriteOptions& options, CMemoryPool*, COutputStream*)
+    cdef CStatus WriteCSV(
+        CRecordBatch&, CCSVWriteOptions& options, CMemoryPool*, COutputStream*)
 
 
 cdef extern from "arrow/json/options.h" nogil:
@@ -1755,6 +1807,7 @@ cdef extern from "arrow/compute/api.h" namespace "arrow::compute" nogil:
     cdef cppclass CCastOptions" arrow::compute::CastOptions"(CFunctionOptions):
         CCastOptions()
         CCastOptions(c_bool safe)
+        CCastOptions(CCastOptions&& options)
 
         @staticmethod
         CCastOptions Safe()
@@ -1781,8 +1834,23 @@ cdef extern from "arrow/compute/api.h" namespace "arrow::compute" nogil:
         CFilterOptions(CFilterNullSelectionBehavior null_selection)
         CFilterNullSelectionBehavior null_selection_behavior
 
+    enum CDictionaryEncodeNullEncodingBehavior \
+            "arrow::compute::DictionaryEncodeOptions::NullEncodingBehavior":
+        CDictionaryEncodeNullEncodingBehavior_ENCODE \
+            "arrow::compute::DictionaryEncodeOptions::ENCODE"
+        CDictionaryEncodeNullEncodingBehavior_MASK \
+            "arrow::compute::DictionaryEncodeOptions::MASK"
+
+    cdef cppclass CDictionaryEncodeOptions \
+            "arrow::compute::DictionaryEncodeOptions"(CFunctionOptions):
+        CDictionaryEncodeOptions()
+        CDictionaryEncodeOptions(
+            CDictionaryEncodeNullEncodingBehavior null_encoding)
+        CDictionaryEncodeNullEncodingBehavior null_encoding
+
     cdef cppclass CTakeOptions \
             " arrow::compute::TakeOptions"(CFunctionOptions):
+        CTakeOptions(c_bool boundscheck)
         c_bool boundscheck
 
     cdef cppclass CStrptimeOptions \
@@ -1791,6 +1859,7 @@ cdef extern from "arrow/compute/api.h" namespace "arrow::compute" nogil:
 
     cdef cppclass CVarianceOptions \
             "arrow::compute::VarianceOptions"(CFunctionOptions):
+        CVarianceOptions(int ddof)
         int ddof
 
     enum CMinMaxMode \
@@ -1800,13 +1869,15 @@ cdef extern from "arrow/compute/api.h" namespace "arrow::compute" nogil:
         CMinMaxMode_EMIT_NULL \
             "arrow::compute::MinMaxOptions::EMIT_NULL"
 
-    cdef cppclass CModeOptions \
-            "arrow::compute::ModeOptions"(CFunctionOptions):
-        int64_t n
-
     cdef cppclass CMinMaxOptions \
             "arrow::compute::MinMaxOptions"(CFunctionOptions):
+        CMinMaxOptions(CMinMaxMode null_handling)
         CMinMaxMode null_handling
+
+    cdef cppclass CModeOptions \
+            "arrow::compute::ModeOptions"(CFunctionOptions):
+        CModeOptions(int64_t n)
+        int64_t n
 
     enum CCountMode \
             "arrow::compute::CountOptions::Mode":
@@ -1817,6 +1888,7 @@ cdef extern from "arrow/compute/api.h" namespace "arrow::compute" nogil:
 
     cdef cppclass CCountOptions \
             "arrow::compute::CountOptions"(CFunctionOptions):
+        CCountOptions(CCountMode count_mode)
         CCountMode count_mode
 
     cdef cppclass CPartitionNthOptions \
@@ -1837,6 +1909,7 @@ cdef extern from "arrow/compute/api.h" namespace "arrow::compute" nogil:
 
     cdef cppclass CArraySortOptions \
             "arrow::compute::ArraySortOptions"(CFunctionOptions):
+        CArraySortOptions(CSortOrder order)
         CSortOrder order
 
     cdef cppclass CSortKey" arrow::compute::SortKey":
@@ -1846,7 +1919,30 @@ cdef extern from "arrow/compute/api.h" namespace "arrow::compute" nogil:
 
     cdef cppclass CSortOptions \
             "arrow::compute::SortOptions"(CFunctionOptions):
+        CSortOptions(vector[CSortKey] sort_keys)
         vector[CSortKey] sort_keys
+
+    enum CQuantileInterp \
+            "arrow::compute::QuantileOptions::Interpolation":
+        CQuantileInterp_LINEAR   "arrow::compute::QuantileOptions::LINEAR"
+        CQuantileInterp_LOWER    "arrow::compute::QuantileOptions::LOWER"
+        CQuantileInterp_HIGHER   "arrow::compute::QuantileOptions::HIGHER"
+        CQuantileInterp_NEAREST  "arrow::compute::QuantileOptions::NEAREST"
+        CQuantileInterp_MIDPOINT "arrow::compute::QuantileOptions::MIDPOINT"
+
+    cdef cppclass CQuantileOptions \
+            "arrow::compute::QuantileOptions"(CFunctionOptions):
+        CQuantileOptions(vector[double] q, CQuantileInterp interpolation)
+        vector[double] q
+        CQuantileInterp interpolation
+
+    cdef cppclass CTDigestOptions \
+            "arrow::compute::TDigestOptions"(CFunctionOptions):
+        CTDigestOptions(vector[double] q,
+                        unsigned int delta, unsigned int buffer_size)
+        vector[double] q
+        unsigned int delta
+        unsigned int buffer_size
 
     enum DatumType" arrow::Datum::type":
         DatumType_NONE" arrow::Datum::NONE"
@@ -2177,6 +2273,11 @@ cdef extern from 'arrow/util/compression.h' namespace 'arrow' nogil:
 cdef extern from 'arrow/util/io_util.h' namespace 'arrow::internal' nogil:
     int ErrnoFromStatus(CStatus status)
     int WinErrorFromStatus(CStatus status)
+    int SignalFromStatus(CStatus status)
+
+    CStatus SendSignal(int signum)
+    CStatus SendSignalToThread(int signum, uint64_t thread_id)
+
 
 cdef extern from 'arrow/util/iterator.h' namespace 'arrow' nogil:
     cdef cppclass CIterator" arrow::Iterator"[T]:

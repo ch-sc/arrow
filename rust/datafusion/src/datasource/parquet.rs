@@ -26,7 +26,7 @@ use arrow::datatypes::*;
 use crate::datasource::datasource::Statistics;
 use crate::datasource::TableProvider;
 use crate::error::Result;
-use crate::logical_plan::Expr;
+use crate::logical_plan::{combine_filters, Expr};
 use crate::physical_plan::parquet::ParquetExec;
 use crate::physical_plan::ExecutionPlan;
 
@@ -43,7 +43,7 @@ pub struct ParquetTable {
 impl ParquetTable {
     /// Attempt to initialize a new `ParquetTable` from a file path.
     pub fn try_new(path: &str, max_concurrency: usize) -> Result<Self> {
-        let parquet_exec = ParquetExec::try_from_path(path, None, None, 0, 1)?;
+        let parquet_exec = ParquetExec::try_from_path(path, None, None, 0, 1, None)?;
         let schema = parquet_exec.schema();
         Ok(Self {
             path: path.to_string(),
@@ -83,14 +83,18 @@ impl TableProvider for ParquetTable {
         projection: &Option<Vec<usize>>,
         batch_size: usize,
         filters: &[Expr],
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let predicate = combine_filters(filters);
         Ok(Arc::new(ParquetExec::try_from_path(
             &self.path,
             projection.clone(),
             predicate,
-            batch_size,
+            limit
+                .map(|l| std::cmp::min(l, batch_size))
+                .unwrap_or(batch_size),
             self.max_concurrency,
+            limit,
         )?))
     }
 
@@ -129,7 +133,7 @@ mod tests {
     async fn read_small_batches() -> Result<()> {
         let table = load_table("alltypes_plain.parquet")?;
         let projection = None;
-        let exec = table.scan(&projection, 2, &[])?;
+        let exec = table.scan(&projection, 2, &[], None)?;
         let stream = exec.execute(0).await?;
 
         let count = stream
@@ -342,18 +346,18 @@ mod tests {
         Ok(())
     }
 
-    fn load_table(name: &str) -> Result<Box<dyn TableProvider>> {
+    fn load_table(name: &str) -> Result<Arc<dyn TableProvider>> {
         let testdata = arrow::util::test_util::parquet_test_data();
         let filename = format!("{}/{}", testdata, name);
         let table = ParquetTable::try_new(&filename, 2)?;
-        Ok(Box::new(table))
+        Ok(Arc::new(table))
     }
 
     async fn get_first_batch(
-        table: Box<dyn TableProvider>,
+        table: Arc<dyn TableProvider>,
         projection: &Option<Vec<usize>>,
     ) -> Result<RecordBatch> {
-        let exec = table.scan(projection, 1024, &[])?;
+        let exec = table.scan(projection, 1024, &[], None)?;
         let mut it = exec.execute(0).await?;
         it.next()
             .await
