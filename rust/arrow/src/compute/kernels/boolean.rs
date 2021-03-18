@@ -37,6 +37,7 @@ use core::iter;
 use lexical_core::Integer;
 
 /// Function input parameters
+///
 /// left data chunk,
 /// left validity chunk,
 /// right data chunk,
@@ -93,8 +94,15 @@ where
         valid_buffer.extend_from_slice(&[valid]);
     };
 
+    let base_iter = left_chunks
+        .iter()
+        .zip(left_valid_chunks.iter())
+        .zip(right_chunks.iter().zip(right_valid_chunks.iter()));
+
     // remainder handling
-    if left_chunks.remainder_len() > 0 {
+    if left_chunks.remainder_len().is_zero() {
+        base_iter.for_each(kleene_op);
+    } else {
         let remainder = (
             (
                 left_chunks.remainder_bits(),
@@ -105,18 +113,8 @@ where
                 right_valid_chunks.remainder_bits(),
             ),
         );
-        left_chunks
-            .iter()
-            .zip(left_valid_chunks.iter())
-            .zip(right_chunks.iter().zip(right_valid_chunks.iter()))
-            .chain(iter::once(remainder))
-            .for_each(kleene_op);
-    } else {
-        left_chunks
-            .iter()
-            .zip(left_valid_chunks.iter())
-            .zip(right_chunks.iter().zip(right_valid_chunks.iter()))
-            .for_each(kleene_op);
+
+        base_iter.chain(iter::once(remainder)).for_each(kleene_op);
     }
 
     let bool_buffer: Buffer = value_buffer.into();
@@ -196,6 +194,55 @@ pub fn and(left: &BooleanArray, right: &BooleanArray) -> Result<BooleanArray> {
     binary_boolean_kernel(&left, &right, buffer_bin_and)
 }
 
+/// Logical 'and' boolean values with Kleene logic
+///
+/// # Behavior
+///
+/// This function behaves as follows with nulls:
+///
+/// * `true` and `null` = `null`
+/// * `null` and `true` = `null`
+/// * `false` and `null` = `false`
+/// * `null` and `false` = `false`
+/// * `null` and `null` = `null`
+///
+/// In other words, in this context a null value really means \"unknown\",
+/// and an unknown value 'and' false is always false.
+/// For a different null behavior, see function \"and\".
+///
+/// # Example
+///
+/// ```rust
+/// use arrow::array::BooleanArray;
+/// use arrow::error::Result;
+/// use arrow::compute::kernels::boolean::and_kleene;
+/// # fn main() -> Result<()> {
+/// let a = BooleanArray::from(vec![Some(true), Some(false), None]);
+/// let b = BooleanArray::from(vec![None, None, None]);
+/// let and_ab = and_kleene(&a, &b)?;
+/// assert_eq!(and_ab, BooleanArray::from(vec![None, Some(false), None]));
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Fails
+///
+/// If the operands have different lengths
+pub fn and_kleene(left: &BooleanArray, right: &BooleanArray) -> Result<BooleanArray> {
+    if left.null_count().is_zero() && right.null_count().is_zero() {
+        return and(left, right);
+    }
+
+    let op = |left_true, left_false, right_true, right_false| {
+        (
+            left_true & right_true,
+            left_false | right_false | (left_true & right_true),
+        )
+    };
+
+    binary_boolean_kleene_kernel(left, right, op)
+}
+
 /// Performs `OR` operation on two arrays. If either left or right value is null then the
 /// result is also null.
 /// # Error
@@ -217,6 +264,40 @@ pub fn or(left: &BooleanArray, right: &BooleanArray) -> Result<BooleanArray> {
     binary_boolean_kernel(&left, &right, buffer_bin_or)
 }
 
+/// Logical 'or' boolean values with Kleene logic
+///
+/// # Behavior
+///
+/// This function behaves as follows with nulls:
+///
+/// * `true` or `null` = `true`
+/// * `null` or `true` = `true`
+/// * `false` or `null` = `null`
+/// * `null` or `false` = `null`
+/// * `null` or `null` = `null`
+///
+/// In other words, in this context a null value really means \"unknown\",
+/// and an unknown value 'or' true is always true.
+/// For a different null behavior, see function \"or\".
+///
+/// # Example
+///
+/// ```rust
+/// use arrow::array::BooleanArray;
+/// use arrow::error::Result;
+/// use arrow::compute::kernels::boolean::or_kleene;
+/// # fn main() -> Result<()> {
+/// let a = BooleanArray::from(vec![Some(true), Some(false), None]);
+/// let b = BooleanArray::from(vec![None, None, None]);
+/// let or_ab = or_kleene(&a, &b)?;
+/// assert_eq!(or_ab, BooleanArray::from(vec![Some(true), None, None]));
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Fails
+///
+/// If the operands have different lengths
 pub fn or_kleene(left: &BooleanArray, right: &BooleanArray) -> Result<BooleanArray> {
     if left.null_count().is_zero() && right.null_count().is_zero() {
         return or(left, right);
@@ -499,9 +580,11 @@ mod tests {
 
     #[test]
     fn test_binary_boolean_kleene_kernel() {
+        // the kleene kernel is based on chunking and we want to also create
+        // cases, where the number of values is not a multiple of 64
         for &value in [true, false].iter() {
             for &is_valid in [true, false].iter() {
-                for n in 0..=128 {
+                for &n in [0usize, 1, 63, 64, 65, 127, 128].iter() {
                     let a = BooleanArray::from(vec![Some(true); n]);
                     let b = BooleanArray::from(vec![None; n]);
 
@@ -520,6 +603,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_bool_array_and_kleene_nulls() {
+        let a = BooleanArray::from(vec![
+            None,
+            None,
+            None,
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(true),
+        ]);
+        let b = BooleanArray::from(vec![
+            None,
+            Some(false),
+            Some(true),
+            None,
+            Some(false),
+            Some(true),
+            None,
+            Some(false),
+            Some(true),
+        ]);
+        let c = and_kleene(&a, &b).unwrap();
+
+        let expected = BooleanArray::from(vec![
+            None,
+            Some(false),
+            None,
+            Some(false),
+            Some(false),
+            Some(false),
+            None,
+            Some(false),
+            Some(true),
+        ]);
+
+        assert_eq!(c, expected);
     }
 
     #[test]
