@@ -65,8 +65,17 @@ where
     let left_buffer = left.values();
     let right_buffer = right.values();
 
-    let left_validity = left.data_ref().null_buffer().unwrap();
-    let right_validity = right.data_ref().null_buffer().unwrap();
+    // If we do not have a validity bitmap, we just need something to iterate over...
+    let left_validity = if let Some(buffer) = left.data_ref().null_buffer() {
+        buffer
+    } else {
+        left.values()
+    };
+    let right_validity = if let Some(buffer) = right.data_ref().null_buffer() {
+        buffer
+    } else {
+        right.values()
+    };
 
     let left_chunks = left_buffer.bit_chunks(left_offset, len);
     let left_valid_chunks = left_validity.bit_chunks(left_offset, len);
@@ -99,22 +108,97 @@ where
         .zip(left_valid_chunks.iter())
         .zip(right_chunks.iter().zip(right_valid_chunks.iter()));
 
-    // remainder handling
-    if left_chunks.remainder_len().is_zero() {
-        base_iter.for_each(kleene_op);
-    } else {
-        let remainder = (
-            (
-                left_chunks.remainder_bits(),
-                left_valid_chunks.remainder_bits(),
-            ),
-            (
-                right_chunks.remainder_bits(),
-                right_valid_chunks.remainder_bits(),
-            ),
-        );
+    // This is very ugly!!!
+    // We would need an Iterator which includes a possible remainder word.
+    // Then we would be close to the c++ implementation which I think does
+    // exactly this.
+    match (
+        left.data_ref().null_buffer().is_some(),
+        right.data_ref().null_buffer().is_some(),
+    ) {
+        (true, true) => {
+            if left_chunks.remainder_len().is_zero() {
+                base_iter.for_each(kleene_op);
+            } else {
+                let remainder = (
+                    (
+                        left_chunks.remainder_bits(),
+                        left_valid_chunks.remainder_bits(),
+                    ),
+                    (
+                        right_chunks.remainder_bits(),
+                        right_valid_chunks.remainder_bits(),
+                    ),
+                );
 
-        base_iter.chain(iter::once(remainder)).for_each(kleene_op);
+                base_iter.chain(iter::once(remainder)).for_each(kleene_op);
+            }
+        }
+        (true, false) => {
+            let base_iter =
+             base_iter.map(|(left, (right_data, _))| (left, (right_data, !0)));
+
+            if left_chunks.remainder_len().is_zero() {
+                base_iter.for_each(kleene_op);
+            } else {
+                let remainder = (
+                    (
+                        left_chunks.remainder_bits(),
+                        left_valid_chunks.remainder_bits(),
+                    ),
+                    (
+                        right_chunks.remainder_bits(),
+                        !0, // all valid!
+                    ),
+                );
+
+                base_iter.chain(iter::once(remainder)).for_each(kleene_op);
+            }
+        }
+        (false, true) => {
+            let base_iter =
+            base_iter.map(|((left_data,_), right)| ((left_data, !0), right));
+
+          if left_chunks.remainder_len().is_zero() {
+                base_iter.for_each(kleene_op);
+            } else {
+                let remainder = (
+                    (
+                        left_chunks.remainder_bits(),
+                        !0, // all valid
+                    ),
+                    (
+                        right_chunks.remainder_bits(),
+                        right_valid_chunks.remainder_bits(),
+                    ),
+                );
+
+                base_iter.chain(iter::once(remainder)).for_each(kleene_op);
+            }
+        }
+        (false, false) => {
+            // This should not happen unless the outer operator fails to check
+            // for both operands being not nullable which should be much more performant.
+            let base_iter =
+            base_iter.map(|((left_data,_), (right_data,_))| ((left_data, !0), (right_data, !0)));
+      
+            if left_chunks.remainder_len().is_zero() {
+                base_iter.for_each(kleene_op);
+            } else {
+                let remainder = (
+                    (
+                        left_chunks.remainder_bits(),
+                        !0, // all valid,
+                    ),
+                    (
+                        right_chunks.remainder_bits(),
+                        !0, // all valid),
+                    ),
+                );
+
+                base_iter.chain(iter::once(remainder)).for_each(kleene_op);
+            }
+        }
     }
 
     let bool_buffer: Buffer = value_buffer.into();
