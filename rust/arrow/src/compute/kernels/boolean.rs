@@ -33,6 +33,7 @@ use crate::compute::util::combine_option_bitmap;
 use crate::datatypes::{ArrowNumericType, DataType};
 use crate::error::{ArrowError, Result};
 use crate::util::bit_util::{ceil, round_upto_multiple_of_64};
+use core::iter;
 use lexical_core::Integer;
 
 /// Function input parameters
@@ -47,7 +48,6 @@ fn binary_boolean_kleene_kernel<F>(
     op: F,
 ) -> Result<BooleanArray>
 where
-    // F: Fn(&Buffer, &Buffer, usize, &Buffer, &Buffer, usize, usize) -> (Buffer, Buffer),
     F: Fn(u64, u64, u64, u64) -> (u64, u64),
 {
     if left.len() != right.len() {
@@ -76,31 +76,48 @@ where
     let result_len = round_upto_multiple_of_64(len) / 8;
     let mut value_buffer = MutableBuffer::new(result_len);
     let mut valid_buffer = MutableBuffer::new(result_len);
-    // value_buffer.resize(result_len, 0);
-    // valid_buffer.resize(result_len, 0);
-    // let value_slice = value_buffer.as_slice_mut();
-    // let valid_slice = valid_buffer.as_slice_mut();
 
-    let mut null_count: u32 = 0;
+    let kleene_op = |((left_data, left_valid), (right_data, right_valid)): (
+        (u64, u64),
+        (u64, u64),
+    )| {
+        let left_true = left_valid & left_data;
+        let left_false = left_valid & !left_data;
 
-    left_chunks
-        .iter()
-        .zip(left_valid_chunks.iter())
-        .zip(right_chunks.iter().zip(right_valid_chunks.iter()))
-        .for_each(|((left_data, left_valid), (right_data, right_valid))| {
-            let left_true = left_valid & left_data;
-            let left_false = left_valid & !left_data;
+        let right_true = right_valid & right_data;
+        let right_false = right_valid & !right_data;
 
-            let right_true = right_valid & right_data;
-            let right_false = right_valid & !right_data;
+        let (value, valid) = op(left_true, left_false, right_true, right_false);
 
-            let (value, valid) = op(left_true, left_false, right_true, right_false);
+        value_buffer.extend_from_slice(&[value]);
+        valid_buffer.extend_from_slice(&[valid]);
+    };
 
-            value_buffer.extend_from_slice(&[value]);
-            valid_buffer.extend_from_slice(&[valid]);
-
-            null_count += valid.count_zeros();
-        });
+    // remainder handling
+    if left_chunks.remainder_len() > 0 {
+        let remainder = (
+            (
+                left_chunks.remainder_bits(),
+                left_valid_chunks.remainder_bits(),
+            ),
+            (
+                right_chunks.remainder_bits(),
+                right_valid_chunks.remainder_bits(),
+            ),
+        );
+        left_chunks
+            .iter()
+            .zip(left_valid_chunks.iter())
+            .zip(right_chunks.iter().zip(right_valid_chunks.iter()))
+            .chain(iter::once(remainder))
+            .for_each(kleene_op);
+    } else {
+        left_chunks
+            .iter()
+            .zip(left_valid_chunks.iter())
+            .zip(right_chunks.iter().zip(right_valid_chunks.iter()))
+            .for_each(kleene_op);
+    }
 
     let bool_buffer: Buffer = value_buffer.into();
     let bool_valid_buffer: Buffer = valid_buffer.into();
@@ -108,7 +125,7 @@ where
     let array_data_ref = Arc::new(ArrayData::new(
         DataType::Boolean,
         len,
-        Some(null_count as usize),
+        None,
         Some(bool_valid_buffer),
         left_offset,
         vec![bool_buffer],
