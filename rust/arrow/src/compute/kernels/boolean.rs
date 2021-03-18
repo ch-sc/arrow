@@ -136,7 +136,7 @@ where
         }
         (true, false) => {
             let base_iter =
-             base_iter.map(|(left, (right_data, _))| (left, (right_data, !0)));
+                base_iter.map(|(left, (right_data, _))| (left, (right_data, !0)));
 
             if left_chunks.remainder_len().is_zero() {
                 base_iter.for_each(kleene_op);
@@ -157,9 +157,9 @@ where
         }
         (false, true) => {
             let base_iter =
-            base_iter.map(|((left_data,_), right)| ((left_data, !0), right));
+                base_iter.map(|((left_data, _), right)| ((left_data, !0), right));
 
-          if left_chunks.remainder_len().is_zero() {
+            if left_chunks.remainder_len().is_zero() {
                 base_iter.for_each(kleene_op);
             } else {
                 let remainder = (
@@ -179,9 +179,10 @@ where
         (false, false) => {
             // This should not happen unless the outer operator fails to check
             // for both operands being not nullable which should be much more performant.
-            let base_iter =
-            base_iter.map(|((left_data,_), (right_data,_))| ((left_data, !0), (right_data, !0)));
-      
+            let base_iter = base_iter.map(|((left_data, _), (right_data, _))| {
+                ((left_data, !0), (right_data, !0))
+            });
+
             if left_chunks.remainder_len().is_zero() {
                 base_iter.for_each(kleene_op);
             } else {
