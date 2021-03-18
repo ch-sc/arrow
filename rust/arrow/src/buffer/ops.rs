@@ -147,6 +147,7 @@ where
     let rem = op(left_chunks.remainder_bits(), right_chunks.remainder_bits());
     // we are counting its starting from the least significant bit, to to_le_bytes should be correct
     let rem = &rem.to_le_bytes()[0..remainder_bytes];
+    // todo: resizing the buffer is required everytime length of input is not divisible by 8!
     buffer.extend_from_slice(rem);
 
     buffer.into()

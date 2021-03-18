@@ -419,13 +419,8 @@ impl fmt::Debug for FixedSizeListArray {
 #[cfg(test)]
 mod tests {
     use crate::{
-        alloc,
-        array::ArrayData,
-        array::Int32Array,
-        buffer::Buffer,
-        datatypes::Field,
-        datatypes::{Int32Type, ToByteSlice},
-        util::bit_util,
+        alloc, array::ArrayData, array::Int32Array, buffer::Buffer, datatypes::Field,
+        datatypes::Int32Type, util::bit_util,
     };
 
     use super::*;
