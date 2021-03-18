@@ -498,6 +498,31 @@ mod tests {
     }
 
     #[test]
+    fn test_binary_boolean_kleene_kernel() {
+        for &value in [true, false].iter() {
+            for &is_valid in [true, false].iter() {
+                for n in 0..=128 {
+                    let a = BooleanArray::from(vec![Some(true); n]);
+                    let b = BooleanArray::from(vec![None; n]);
+
+                    let result = binary_boolean_kleene_kernel(&a, &b, |_, _, _, _| {
+                        let value = if value { u64::MAX } else { 0 };
+                        let is_valid = if is_valid { u64::MAX } else { 0 };
+                        (value, is_valid)
+                    })
+                    .unwrap();
+
+                    assert_eq!(result.len(), n);
+                    (0..n).for_each(|idx| {
+                        assert_eq!(value, result.value(idx));
+                        assert_eq!(is_valid, result.is_valid(idx));
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_bool_array_or_kleene_nulls() {
         let a = BooleanArray::from(vec![
             None,
