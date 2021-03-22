@@ -36,13 +36,6 @@ use crate::util::bit_util::{ceil, round_upto_multiple_of_64};
 use core::iter;
 use lexical_core::Integer;
 
-/// Function input parameters
-///
-/// left data chunk,
-/// left validity chunk,
-/// right data chunk,
-/// right validity chunk,
-/// -> (result data chunk, result validity chunk)
 fn binary_boolean_kleene_kernel<F>(
     left: &BooleanArray,
     right: &BooleanArray,
@@ -65,8 +58,17 @@ where
     let left_buffer = left.values();
     let right_buffer = right.values();
 
-    let left_validity = left.data_ref().null_buffer().unwrap();
-    let right_validity = right.data_ref().null_buffer().unwrap();
+    // If we do not have a validity bitmap, we just need something to iterate over...
+    let left_validity = if let Some(buffer) = left.data_ref().null_buffer() {
+        buffer
+    } else {
+        left.values()
+    };
+    let right_validity = if let Some(buffer) = right.data_ref().null_buffer() {
+        buffer
+    } else {
+        right.values()
+    };
 
     let left_chunks = left_buffer.bit_chunks(left_offset, len);
     let left_valid_chunks = left_validity.bit_chunks(left_offset, len);
@@ -99,23 +101,65 @@ where
         .zip(left_valid_chunks.iter())
         .zip(right_chunks.iter().zip(right_valid_chunks.iter()));
 
-    // remainder handling
-    if left_chunks.remainder_len().is_zero() {
-        base_iter.for_each(kleene_op);
-    } else {
-        let remainder = (
-            (
-                left_chunks.remainder_bits(),
-                left_valid_chunks.remainder_bits(),
-            ),
-            (
-                right_chunks.remainder_bits(),
-                right_valid_chunks.remainder_bits(),
-            ),
-        );
+    // To get rid off the additional remainder logic we would need an iterator
+    // which provides a possible remainder word.
+    let mut remainder = (
+        (
+            left_chunks.remainder_bits(),
+            left_valid_chunks.remainder_bits(),
+        ),
+        (
+            right_chunks.remainder_bits(),
+            right_valid_chunks.remainder_bits(),
+        ),
+    );
 
-        base_iter.chain(iter::once(remainder)).for_each(kleene_op);
-    }
+    match (
+        left.data_ref().null_buffer().is_some(),
+        right.data_ref().null_buffer().is_some(),
+    ) {
+        (true, true) => {
+            base_iter.chain(iter::once(remainder)).for_each(kleene_op);
+        }
+        (true, false) => {
+            remainder.1 = (
+                right_chunks.remainder_bits(),
+                u64::MAX, // all valid
+            );
+            base_iter
+                .chain(iter::once(remainder))
+                .map(|(left, (right_data, _))| (left, (right_data, u64::MAX)))
+                .for_each(kleene_op);
+        }
+        (false, true) => {
+            remainder.0 = (
+                left_chunks.remainder_bits(),
+                u64::MAX, // all valid
+            );
+            base_iter
+                .chain(iter::once(remainder))
+                .map(|((left_data, _), right)| ((left_data, u64::MAX), right))
+                .for_each(kleene_op);
+        }
+        (false, false) => {
+            let remainder = (
+                (
+                    left_chunks.remainder_bits(),
+                    u64::MAX, // all valid,
+                ),
+                (
+                    right_chunks.remainder_bits(),
+                    u64::MAX, // all valid),
+                ),
+            );
+            base_iter
+                .chain(iter::once(remainder))
+                .map(|((left_data, _), (right_data, _))| {
+                    ((left_data, u64::MAX), (right_data, u64::MAX))
+                })
+                .for_each(kleene_op);
+        }
+    };
 
     let bool_buffer: Buffer = value_buffer.into();
     let bool_valid_buffer: Buffer = valid_buffer.into();
@@ -679,6 +723,72 @@ mod tests {
             None,
             Some(false),
             Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+        ]);
+
+        assert_eq!(c, expected);
+    }
+
+    #[test]
+    fn test_bool_array_or_kleene_right_sided_nulls() {
+        let a = BooleanArray::from(vec![false, false, false, true, true, true]);
+
+        // ensure null bitmap of a is absent
+        assert!(a.data_ref().null_bitmap().is_none());
+
+        let b = BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+            Some(false),
+            None,
+        ]);
+
+        // ensure null bitmap of b is present
+        assert!(b.data_ref().null_bitmap().is_some());
+
+        let c = or_kleene(&a, &b).unwrap();
+
+        let expected = BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+            Some(true),
+            Some(true),
+        ]);
+
+        assert_eq!(c, expected);
+    }
+
+    #[test]
+    fn test_bool_array_or_kleene_left_sided_nulls() {
+        let a = BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+            Some(false),
+            None,
+        ]);
+
+        // ensure null bitmap of b is absent
+        assert!(a.data_ref().null_bitmap().is_some());
+
+        let b = BooleanArray::from(vec![false, false, false, true, true, true]);
+
+        // ensure null bitmap of a is present
+        assert!(b.data_ref().null_bitmap().is_none());
+
+        let c = or_kleene(&a, &b).unwrap();
+
+        let expected = BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
             Some(true),
             Some(true),
             Some(true),
